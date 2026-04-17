@@ -1,0 +1,147 @@
+import asyncio
+import json
+import os
+
+from pptx import Presentation
+from pptx.dml.color import RGBColor
+from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE
+from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
+from pptx.util import Inches
+
+from image_service import generate_slide_image
+
+SLIDE_W = Inches(13.333)
+SLIDE_H = Inches(7.5)
+
+
+def _clean_json_string(json_string: str) -> str:
+    cleaned = (json_string or "").strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        if cleaned.lower().startswith("json"):
+            cleaned = cleaned[4:].strip()
+    start_index = -1
+    for marker in ("[", "{"):
+        index = cleaned.find(marker)
+        if index != -1 and (start_index == -1 or index < start_index):
+            start_index = index
+    if start_index > 0:
+        cleaned = cleaned[start_index:]
+    end_index = max(cleaned.rfind("]"), cleaned.rfind("}"))
+    if end_index != -1:
+        cleaned = cleaned[: end_index + 1]
+    return cleaned.strip()
+
+
+def _normalize_slides(payload) -> list[dict]:
+    if isinstance(payload, list):
+        return [s for s in payload if isinstance(s, dict)]
+    if isinstance(payload, dict):
+        slides = payload.get("slides")
+        if isinstance(slides, list):
+            return [s for s in slides if isinstance(s, dict)]
+        if "image_prompt" in payload:
+            return [payload]
+    raise ValueError("Unsupported presentation payload format")
+
+
+def _add_fallback_slide(prs: Presentation, slide_number: int) -> None:
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    fill = slide.background.fill
+    fill.solid()
+    fill.fore_color.rgb = RGBColor(245, 245, 245)
+
+    box_width = int(prs.slide_width * 0.6)
+    box_height = int(prs.slide_height * 0.24)
+    left = int((prs.slide_width - box_width) / 2)
+    top = int((prs.slide_height - box_height) / 2)
+
+    shape = slide.shapes.add_shape(
+        MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE,
+        left,
+        top,
+        box_width,
+        box_height,
+    )
+    shape.fill.solid()
+    shape.fill.fore_color.rgb = RGBColor(255, 255, 255)
+    shape.line.color.rgb = RGBColor(200, 60, 60)
+    shape.line.width = Inches(0.03)
+
+    text_frame = shape.text_frame
+    text_frame.clear()
+    text_frame.word_wrap = True
+    text_frame.vertical_anchor = MSO_ANCHOR.MIDDLE
+
+    paragraph = text_frame.paragraphs[0]
+    paragraph.alignment = PP_ALIGN.CENTER
+    run = paragraph.add_run()
+    run.text = "⚠️ ОШИБКА АПИ: Изображение не сгенерировалось"
+    run.font.bold = True
+    run.font.size = Inches(0.28)
+    run.font.color.rgb = RGBColor(180, 30, 30)
+
+
+async def build_pptx_from_json(json_string: str, output_filename: str) -> str:
+    generated_image_paths: list[str] = []
+    try:
+        cleaned_json = _clean_json_string(json_string)
+        payload = json.loads(cleaned_json)
+        slides = _normalize_slides(payload)
+        if not slides:
+            raise ValueError("No slides found in JSON")
+
+        output_dir = os.path.dirname(output_filename)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+
+        prs = Presentation()
+        prs.slide_width = SLIDE_W
+        prs.slide_height = SLIDE_H
+
+        success_count = 0
+
+        for index, slide_data in enumerate(slides):
+            slide_number = int(slide_data.get("slide_number") or index + 1)
+            image_prompt = str(slide_data.get("image_prompt") or "").strip()
+
+            if not image_prompt or image_prompt.lower() in ("null", "none", ""):
+                _add_fallback_slide(prs, slide_number)
+                continue
+
+            image_path = await generate_slide_image(image_prompt, slide_number)
+
+            if image_path:
+                generated_image_paths.append(image_path)
+                slide = prs.slides.add_slide(prs.slide_layouts[6])
+                slide.shapes.add_picture(
+                    image_path,
+                    0,
+                    0,
+                    width=prs.slide_width,
+                    height=prs.slide_height,
+                )
+                success_count += 1
+            else:
+                _add_fallback_slide(prs, slide_number)
+
+            # Rate limit: pause between API calls to avoid 429
+            if index < len(slides) - 1:
+                await asyncio.sleep(3)
+
+        if len(prs.slides) == 0:
+            raise ValueError("No slides were created")
+
+        prs.save(output_filename)
+        print(f"Presentation saved: {success_count}/{len(slides)} slides with images")
+        return output_filename
+
+    except Exception as exc:
+        raise ValueError(f"Failed to build presentation: {exc}") from exc
+    finally:
+        for p in generated_image_paths:
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass

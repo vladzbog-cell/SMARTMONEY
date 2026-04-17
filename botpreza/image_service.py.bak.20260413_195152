@@ -1,0 +1,114 @@
+import asyncio
+import base64
+import os
+
+from dotenv import load_dotenv
+from google.genai import types
+
+from artemox_client import ARTEMOX_IMAGE_GENERATION_MODEL, get_artemox_client
+
+
+load_dotenv("keys.env")
+
+
+STYLE_ANCHOR = (
+    ", highly detailed professional presentation slide, clean typography, "
+    "perfect text rendering, infographic style, high quality presentation graphic design, "
+    "clean vector-like text"
+)
+
+
+def _build_image_prompt(prompt: str) -> str:
+    normalized = (prompt or "").strip()
+    return (
+        "Generate an image (no text response, only image): "
+        + normalized
+        + STYLE_ANCHOR
+    )
+
+
+def _validate_image(path: str) -> bool:
+    """Check that the saved file is a valid image."""
+    try:
+        with open(path, "rb") as f:
+            header = f.read(16)
+        # PNG magic: \x89PNG
+        if header[:4] == b"\x89PNG":
+            return True
+        # JPEG magic: \xff\xd8\xff
+        if header[:3] == b"\xff\xd8\xff":
+            return True
+        # WEBP magic: RIFF....WEBP
+        if header[:4] == b"RIFF" and header[8:12] == b"WEBP":
+            return True
+        print(f"⚠️ Unknown image format, header: {header[:16].hex()}")
+        return False
+    except Exception:
+        return False
+
+
+async def generate_slide_image(prompt: str, slide_index: int) -> str | None:
+    if not prompt or prompt.strip().lower() in ("null", "none", ""):
+        return None
+
+    try:
+        client = get_artemox_client()
+        if client is None:
+            return None
+
+        final_prompt = _build_image_prompt(prompt)
+
+        os.makedirs("temp", exist_ok=True)
+        output_path = os.path.join("temp", f"slide_{slide_index}.png")
+
+        response = await asyncio.to_thread(
+            client.models.generate_content,
+            model=ARTEMOX_IMAGE_GENERATION_MODEL,
+            contents=final_prompt,
+            config=types.GenerateContentConfig(
+                response_modalities=["IMAGE"],
+                image_config=types.ImageConfig(
+                    aspect_ratio="16:9",
+                ),
+            ),
+        )
+
+        # Extract image bytes from response parts
+        if not response.candidates:
+            print(f"⚠️ No candidates in response for slide {slide_index}")
+            return None
+
+        for part in response.candidates[0].content.parts:
+            # Skip text parts
+            if part.text:
+                print(f"ℹ️ Slide {slide_index} got text part: {part.text[:100]}")
+                continue
+
+            if part.inline_data and part.inline_data.data:
+                image_bytes = part.inline_data.data
+                mime = getattr(part.inline_data, "mime_type", None) or ""
+                print(f"ℹ️ Slide {slide_index}: inline_data mime={mime}, type={type(image_bytes).__name__}, len={len(image_bytes)}")
+
+                # API may return base64-encoded data as bytes or str
+                if isinstance(image_bytes, (bytes, str)):
+                    raw = image_bytes if isinstance(image_bytes, bytes) else image_bytes.encode("utf-8")
+                    # Detect base64: PNG starts with iVBOR, JPEG with /9j/, WEBP with UklG
+                    if raw[:5] == b"iVBOR" or raw[:4] in (b"/9j/", b"UklG"):
+                        raw = base64.b64decode(raw)
+                    image_bytes = raw
+
+                with open(output_path, "wb") as f:
+                    f.write(image_bytes)
+
+                if _validate_image(output_path):
+                    return output_path
+                else:
+                    print(f"⚠️ Slide {slide_index}: saved file is not a valid image, size={len(image_bytes)}")
+                    os.remove(output_path)
+                    return None
+
+        print(f"⚠️ No image data in response for slide {slide_index}")
+        return None
+    except Exception as e:
+        print(f"❌ Ошибка Imagen на слайде {slide_index}: {e}")
+        return None
