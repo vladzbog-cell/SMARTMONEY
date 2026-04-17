@@ -1,0 +1,917 @@
+import asyncio
+import hashlib
+import json
+import os
+import re
+
+from pptx import Presentation
+from pptx.dml.color import RGBColor
+from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE, MSO_CONNECTOR
+from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
+from pptx.util import Inches, Pt
+
+from image_service import generate_slide_image
+
+SLIDE_W = Inches(13.333)
+SLIDE_H = Inches(7.5)
+
+BG = RGBColor(247, 246, 242)
+SURFACE = RGBColor(255, 255, 252)
+WHITE = RGBColor(255, 255, 255)
+INK = RGBColor(30, 43, 67)
+MUTED = RGBColor(97, 107, 126)
+LINE = RGBColor(208, 214, 223)
+ACCENT = RGBColor(50, 126, 151)
+ACCENT_ALT = RGBColor(207, 128, 75)
+ACCENT_SOFT = RGBColor(229, 236, 241)
+OVERLAY_PANEL = RGBColor(30, 30, 30)
+TITLE_ON_DARK = RGBColor(255, 255, 255)
+BODY_ON_DARK = RGBColor(232, 236, 242)
+CARD_BG = RGBColor(250, 252, 255)
+CARD_TITLE = RGBColor(24, 36, 58)
+CARD_BODY = RGBColor(72, 86, 112)
+
+
+def _clean_json_string(json_string: str) -> str:
+    cleaned = (json_string or "").strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        if cleaned.lower().startswith("json"):
+            cleaned = cleaned[4:].strip()
+    start_index = -1
+    for marker in ("[", "{"):
+        index = cleaned.find(marker)
+        if index != -1 and (start_index == -1 or index < start_index):
+            start_index = index
+    if start_index > 0:
+        cleaned = cleaned[start_index:]
+    end_index = max(cleaned.rfind("]"), cleaned.rfind("}"))
+    if end_index != -1:
+        cleaned = cleaned[: end_index + 1]
+    return cleaned.strip()
+
+
+def _normalize_slides(payload) -> list[dict]:
+    if isinstance(payload, list):
+        return [s for s in payload if isinstance(s, dict)]
+    if isinstance(payload, dict):
+        slides = payload.get("slides")
+        if isinstance(slides, list):
+            return [s for s in slides if isinstance(s, dict)]
+        if "image_prompt" in payload:
+            return [payload]
+    raise ValueError("Unsupported presentation payload format")
+
+
+def _extract_title(slide_data: dict, fallback_number: int) -> str:
+    content_block = slide_data.get("content")
+    if isinstance(content_block, dict):
+        for key in ("title", "headline", "heading", "name", "topic"):
+            value = str(content_block.get(key) or "").strip()
+            if value and value.lower() not in ("null", "none"):
+                normalized = re.sub(r"\s+", " ", value).strip(" .;:-")
+                if normalized:
+                    return normalized[:84]
+
+    for key in ("title", "headline", "heading", "slide_title", "name", "topic"):
+        value = str(slide_data.get(key) or "").strip()
+        if value and value.lower() not in ("null", "none"):
+            normalized = re.sub(r"\s+", " ", value).strip(" .;:-")
+            if len(normalized) > 84:
+                cut = normalized[:84]
+                pivot = max(cut.rfind("."), cut.rfind(":"), cut.rfind(","), cut.rfind(" "))
+                if pivot > 52:
+                    cut = cut[:pivot]
+                normalized = cut.strip(" .;:-")
+            return normalized
+    return f"Слайд {fallback_number}"
+
+
+def _normalize_bullet_lines(value) -> list[str]:
+    if isinstance(value, list):
+        result = []
+        for item in value:
+            text = str(item or "").strip()
+            if text and text.lower() not in ("null", "none"):
+                cleaned = re.sub(r"^\d+\.\s*", "", text.lstrip("-• ").strip())
+                cleaned = re.sub(r"\s+", " ", cleaned).strip(" .;:-")
+                result.append(cleaned)
+        return result
+
+    text = str(value or "").strip()
+    if not text or text.lower() in ("null", "none"):
+        return []
+
+    result = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if line:
+            cleaned = re.sub(r"^\d+\.\s*", "", line.lstrip("-• ").strip())
+            cleaned = re.sub(r"\s+", " ", cleaned).strip(" .;:-")
+            result.append(cleaned)
+    return result
+
+
+def _dedupe_and_shorten(lines: list[str], *, max_len: int = 128, max_items: int = 4) -> list[str]:
+    result: list[str] = []
+    seen: list[str] = []
+    for line in lines:
+        text = re.sub(r"\(([^)]{1,80})\)\s*\(\1\)", r"(\1)", line)
+        text = re.sub(r"\s+", " ", text).strip(" .;:-")
+        if not text:
+            continue
+        if len(text) > max_len:
+            cut = text[:max_len]
+            pivot = max(cut.rfind("."), cut.rfind(":"), cut.rfind(","), cut.rfind(" "))
+            if pivot > int(max_len * 0.6):
+                cut = cut[:pivot]
+            text = cut.strip(" .;:-")
+        key = re.sub(r"[^a-zа-яё0-9 ]+", " ", text.lower())
+        key = re.sub(r"\s+", " ", key).strip()
+        if len(key) < 8:
+            continue
+        if key in seen:
+            continue
+        if any((key in prev or prev in key) and min(len(key), len(prev)) > 20 for prev in seen):
+            continue
+        result.append(text)
+        seen.append(key)
+        if len(result) >= max_items:
+            break
+    return result
+
+
+def _extract_bullets(slide_data: dict) -> list[str]:
+    content_block = slide_data.get("content")
+    if isinstance(content_block, dict):
+        for key in ("bullets", "theses", "points", "key_points", "highlights", "items", "text"):
+            lines = _dedupe_and_shorten(_normalize_bullet_lines(content_block.get(key)))
+            if lines:
+                return lines[:6]
+
+    for key in ("bullets", "theses", "points", "key_points", "highlights", "content", "body", "text"):
+        lines = _dedupe_and_shorten(_normalize_bullet_lines(slide_data.get(key)))
+        if lines:
+            return lines[:6]
+
+    subtitle = str(slide_data.get("subtitle") or "").strip()
+    if subtitle and subtitle.lower() not in ("null", "none"):
+        return [subtitle]
+
+    image_prompt = str(slide_data.get("image_prompt") or "").strip()
+    if image_prompt:
+        fallback = image_prompt[:180] + "..." if len(image_prompt) > 180 else image_prompt
+        return _dedupe_and_shorten([fallback], max_items=1)
+    return []
+
+
+def _kicker(layout: str) -> str:
+    mapping = {
+        "hero": "Стратегический обзор",
+        "cards": "Ключевые темы",
+        "process": "Последовательность действий",
+        "chart_focus": "Динамика и метрики",
+        "comparison": "Сравнение сценариев",
+        "matrix": "Матрица приоритетов",
+        "radial": "Системная архитектура",
+    }
+    return mapping.get(layout, "Аналитический слайд")
+
+
+def _layout_type(slide_data: dict, slide_number: int) -> str:
+    raw = str(slide_data.get("layout_type") or "").strip().lower()
+    aliases = {
+        "split_infographic": "split_infographic",
+        "hero_concept": "hero_concept",
+        "data_matrix": "data_matrix",
+        "timeline": "timeline",
+        "hero": "hero_concept",
+        "cards": "split_infographic",
+        "process": "timeline",
+        "chart_focus": "split_infographic",
+        "comparison": "split_infographic",
+        "matrix": "data_matrix",
+        "radial": "split_infographic",
+    }
+    if raw in aliases:
+        return aliases[raw]
+    cycle = ["hero_concept", "split_infographic", "timeline", "data_matrix"]
+    return cycle[(slide_number - 1) % len(cycle)]
+
+
+def _hash_values(seed: str, count: int, min_val: int, max_val: int) -> list[int]:
+    digest = hashlib.sha256(seed.encode("utf-8")).digest()
+    span = max_val - min_val
+    values = []
+    for idx in range(count):
+        values.append(min_val + digest[idx] % max(span, 1))
+    return values
+
+
+def _set_slide_background(slide) -> None:
+    fill = slide.background.fill
+    fill.solid()
+    fill.fore_color.rgb = BG
+
+
+def _add_grid(slide, left, top, width, height, step_x=Inches(0.42), step_y=Inches(0.34), opacity=0.55):
+    line_color = RGBColor(228, 232, 238)
+    x = left
+    while x <= left + width:
+        line = slide.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, x, top, x, top + height)
+        line.line.color.rgb = line_color
+        line.line.transparency = opacity
+        line.line.width = Pt(0.5)
+        x += step_x
+    y = top
+    while y <= top + height:
+        line = slide.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, left, y, left + width, y)
+        line.line.color.rgb = line_color
+        line.line.transparency = opacity
+        line.line.width = Pt(0.5)
+        y += step_y
+
+
+def _add_textbox(slide, left, top, width, height, text, size, color, *, bold=False, align=PP_ALIGN.LEFT):
+    box = slide.shapes.add_textbox(left, top, width, height)
+    frame = box.text_frame
+    frame.clear()
+    frame.word_wrap = True
+    frame.vertical_anchor = MSO_ANCHOR.TOP
+    paragraph = frame.paragraphs[0]
+    paragraph.alignment = align
+    run = paragraph.add_run()
+    run.text = text
+    run.font.name = "Arial"
+    run.font.size = Pt(size)
+    run.font.bold = bold
+    run.font.color.rgb = color
+    return box
+
+
+def _add_panel(slide, left, top, width, height, *, radius=True, fill_color=SURFACE, transparency=0.1):
+    shape_type = MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE if radius else MSO_AUTO_SHAPE_TYPE.RECTANGLE
+    shape = slide.shapes.add_shape(shape_type, left, top, width, height)
+    shape.fill.solid()
+    shape.fill.fore_color.rgb = fill_color
+    shape.fill.transparency = transparency
+    shape.line.color.rgb = LINE
+    shape.line.width = Pt(0.8)
+    return shape
+
+
+def _add_full_bleed_background(slide, image_path: str, *, veil_color=WHITE, veil_transparency=0.18) -> None:
+    slide.shapes.add_picture(image_path, 0, 0, width=SLIDE_W, height=SLIDE_H)
+    veil = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, 0, 0, SLIDE_W, SLIDE_H)
+    veil.fill.solid()
+    veil.fill.fore_color.rgb = veil_color
+    veil.fill.transparency = veil_transparency
+    veil.line.fill.background()
+
+
+def _apply_full_bleed_base(slide, image_path: str, *, veil_transparency=0.26) -> None:
+    _add_full_bleed_background(slide, image_path, veil_color=WHITE, veil_transparency=veil_transparency)
+
+
+def _add_accent_bar(slide, left, top, width, color):
+    bar = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, left, top, width, Inches(0.08))
+    bar.fill.solid()
+    bar.fill.fore_color.rgb = color
+    bar.line.fill.background()
+    return bar
+
+
+def _add_accent_image(slide, image_path: str, left, top, width, height) -> None:
+    slide.shapes.add_picture(image_path, left, top, width=width, height=height)
+    frame = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, left, top, width, height)
+    frame.fill.background()
+    frame.line.color.rgb = LINE
+    frame.line.width = Pt(0.6)
+
+
+def _add_editorial_image_accent(slide, image_path: str, left, top, width, height, *, veil_transparency=0.78) -> None:
+    slide.shapes.add_picture(image_path, left, top, width=width, height=height)
+    frame = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, left, top, width, height)
+    frame.fill.background()
+    frame.line.color.rgb = LINE
+    frame.line.width = Pt(0.7)
+
+
+def _add_hairline_rule(slide, x1, y1, x2, y2, *, color=LINE, width=0.8, transparency=0.08):
+    line = slide.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, x1, y1, x2, y2)
+    line.line.color.rgb = color
+    line.line.width = Pt(width)
+    line.line.transparency = transparency
+    return line
+
+
+def _split_label(text: str) -> tuple[str, str]:
+    text = (text or "").strip()
+    if ":" in text:
+        head, tail = text.split(":", 1)
+        if len(head) < 40:
+            return head.strip(), tail.strip()
+    words = text.split()
+    if len(words) > 5:
+        return " ".join(words[:3]), " ".join(words[3:])
+    return text, ""
+
+
+def _draw_title_band(slide, title: str, kicker: str | None = None) -> None:
+    if kicker:
+        _add_textbox(slide, Inches(0.72), Inches(0.46), Inches(2.5), Inches(0.18), kicker.upper(), 8, ACCENT_ALT, bold=True)
+    _add_hairline_rule(slide, Inches(0.72), Inches(0.66), Inches(12.45), Inches(0.66), transparency=0.0)
+    _add_textbox(slide, Inches(0.72), Inches(0.82), Inches(7.9), Inches(0.58), title, 24, INK, bold=True)
+
+
+def _render_hero(slide, image_path: str, title: str, bullets: list[str]) -> None:
+    _apply_full_bleed_base(slide, image_path, veil_transparency=0.24)
+    _add_hairline_rule(slide, Inches(0.55), Inches(0.55), Inches(12.8), Inches(0.55), transparency=0.0)
+    _add_panel(slide, Inches(0.58), Inches(0.82), Inches(5.5), Inches(5.95), fill_color=WHITE, transparency=0.14)
+    _add_hairline_rule(slide, Inches(6.55), Inches(1.02), Inches(6.55), Inches(6.62), transparency=0.0)
+    _add_hairline_rule(slide, Inches(6.55), Inches(6.62), Inches(12.5), Inches(6.62), transparency=0.0)
+    _add_textbox(slide, Inches(0.72), Inches(0.86), Inches(4.9), Inches(0.22), _kicker("hero").upper(), 8, ACCENT_ALT, bold=True)
+    _add_textbox(slide, Inches(0.72), Inches(1.18), Inches(5.15), Inches(2.75), title, 31, INK, bold=True)
+    subtitle = bullets[0] if bullets else ""
+    if subtitle:
+        _add_textbox(slide, Inches(0.72), Inches(3.95), Inches(4.95), Inches(0.88), subtitle, 17, INK)
+    for idx, bullet in enumerate(bullets[1:3], start=0):
+        top = Inches(5.0 + idx * 0.66)
+        _add_hairline_rule(slide, Inches(0.72), top + Inches(0.18), Inches(0.98), top + Inches(0.18), color=ACCENT if idx == 0 else ACCENT_ALT, width=2.2, transparency=0.0)
+        _add_textbox(slide, Inches(1.08), top, Inches(4.6), Inches(0.34), bullet, 11, MUTED)
+    # No system footer: keeps title slide cleaner and closer to editorial reference style.
+
+
+def _render_cards(slide, image_path: str, title: str, bullets: list[str]) -> None:
+    _apply_full_bleed_base(slide, image_path, veil_transparency=0.27)
+    _draw_title_band(slide, title, _kicker("cards"))
+    positions = [
+        (Inches(0.72), Inches(2.0), Inches(5.55), Inches(1.78)),
+        (Inches(6.0), Inches(2.0), Inches(6.0), Inches(1.78)),
+        (Inches(0.72), Inches(4.08), Inches(5.55), Inches(1.78)),
+        (Inches(6.0), Inches(4.08), Inches(6.0), Inches(1.78)),
+    ]
+    for idx, bullet in enumerate((bullets + [""] * 4)[:4]):
+        heading, body = _split_label(bullet or "Insight")
+        left, top, width, height = positions[idx]
+        fill = ACCENT_SOFT if idx in (0, 3) else SURFACE
+        _add_panel(slide, left, top, width, height, fill_color=fill, transparency=0.03)
+        _add_hairline_rule(slide, left, top + Inches(0.14), left + Inches(0.86), top + Inches(0.14), color=ACCENT if idx % 2 == 0 else ACCENT_ALT, width=2.2, transparency=0.0)
+        _add_textbox(slide, left + Inches(0.2), top + Inches(0.28), width - Inches(0.42), Inches(0.28), heading, 13, INK, bold=True)
+        _add_textbox(slide, left + Inches(0.2), top + Inches(0.66), width - Inches(0.42), Inches(0.68), body or heading, 11, MUTED)
+
+
+def _render_process(slide, image_path: str, title: str, bullets: list[str]) -> None:
+    _apply_full_bleed_base(slide, image_path, veil_transparency=0.27)
+    _draw_title_band(slide, title, _kicker("process"))
+    fallback_steps = ["Диагностика", "Приоритизация", "Внедрение", "Контроль результата"]
+    fallback_step_bodies = [
+        "Собрать факты, ограничения и контекст задачи.",
+        "Определить приоритеты по влиянию и сложности.",
+        "Запустить меры и закрепить зоны ответственности.",
+        "Контролировать KPI и корректировать план.",
+    ]
+    steps = (bullets + fallback_steps)[:4]
+    start_x = Inches(0.65)
+    y = Inches(3.45)
+    step_w = Inches(2.8)
+    _add_hairline_rule(slide, Inches(1.05), Inches(4.32), Inches(12.05), Inches(4.32), transparency=0.0)
+    for idx, bullet in enumerate(steps):
+        left = start_x + idx * Inches(3.05)
+        heading, body = _split_label(bullet)
+        if not body or body.lower() == heading.lower():
+            body = fallback_step_bodies[idx] if idx < len(fallback_step_bodies) else "Ключевые действия этапа"
+        _add_panel(slide, left, y, step_w, Inches(1.45), fill_color=WHITE, transparency=0.02)
+        chip = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.OVAL, left + Inches(0.14), y - Inches(0.32), Inches(0.5), Inches(0.5))
+        chip.fill.solid()
+        chip.fill.fore_color.rgb = ACCENT if idx % 2 == 0 else ACCENT_ALT
+        chip.line.fill.background()
+        _add_textbox(slide, left + Inches(0.22), y + Inches(0.16), Inches(2.3), Inches(0.26), f"{idx + 1}. {heading}", 13, INK, bold=True)
+        _add_textbox(slide, left + Inches(0.22), y + Inches(0.5), Inches(2.3), Inches(0.5), body or heading, 10, MUTED)
+        if idx < len(steps) - 1:
+            _add_hairline_rule(slide, left + step_w, y + Inches(0.74), left + Inches(3.0), y + Inches(0.74), transparency=0.0)
+
+
+def _render_chart_focus(slide, image_path: str, title: str, bullets: list[str]) -> None:
+    _apply_full_bleed_base(slide, image_path, veil_transparency=0.28)
+    _draw_title_band(slide, title, _kicker("chart_focus"))
+    _add_panel(slide, Inches(0.6), Inches(1.75), Inches(7.55), Inches(4.95))
+    _add_grid(slide, Inches(1.0), Inches(2.2), Inches(6.7), Inches(3.95), step_x=Inches(0.85), step_y=Inches(0.72), opacity=0.35)
+    values = _hash_values(title + "|" + " ".join(bullets), 6, 10, 90)
+    points = []
+    for idx, value in enumerate(values):
+        x = Inches(1.12 + idx * 1.08)
+        y = Inches(5.8 - (value / 100) * 3.0)
+        points.append((x, y))
+    for idx in range(len(points) - 1):
+        line = slide.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, points[idx][0], points[idx][1], points[idx + 1][0], points[idx + 1][1])
+        line.line.color.rgb = ACCENT if idx < len(points) - 2 else ACCENT_ALT
+        line.line.width = Pt(2.0)
+    for x, y in points:
+        dot = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.OVAL, x - Inches(0.06), y - Inches(0.06), Inches(0.12), Inches(0.12))
+        dot.fill.solid()
+        dot.fill.fore_color.rgb = ACCENT
+        dot.line.fill.background()
+    for idx, bullet in enumerate((bullets + [""] * 2)[:2]):
+        heading, body = _split_label(bullet or "Finding")
+        top = Inches(4.1 + idx * 1.2)
+        _add_panel(slide, Inches(8.4), top, Inches(4.3), Inches(1.05))
+        _add_textbox(slide, Inches(8.62), top + Inches(0.16), Inches(3.8), Inches(0.25), heading, 12, INK, bold=True)
+        _add_textbox(slide, Inches(8.62), top + Inches(0.48), Inches(3.8), Inches(0.35), body or heading, 10, MUTED)
+
+
+def _render_comparison(slide, image_path: str, title: str, bullets: list[str]) -> None:
+    _apply_full_bleed_base(slide, image_path, veil_transparency=0.27)
+    _draw_title_band(slide, title, _kicker("comparison"))
+    _add_panel(slide, Inches(0.6), Inches(1.95), Inches(5.85), Inches(4.7))
+    _add_panel(slide, Inches(6.85), Inches(1.95), Inches(5.85), Inches(4.7))
+    left_title, left_body = _split_label(bullets[0] if bullets else "Левая позиция")
+    right_title, right_body = _split_label(bullets[1] if len(bullets) > 1 else "Правая позиция")
+    _add_accent_bar(slide, Inches(0.6), Inches(1.95), Inches(0.8), ACCENT)
+    _add_accent_bar(slide, Inches(6.85), Inches(1.95), Inches(0.8), ACCENT_ALT)
+    _add_textbox(slide, Inches(0.85), Inches(2.25), Inches(5.1), Inches(0.35), left_title, 14, INK, bold=True)
+    _add_textbox(slide, Inches(0.85), Inches(2.72), Inches(5.1), Inches(2.0), left_body or left_title, 12, MUTED)
+    _add_textbox(slide, Inches(7.1), Inches(2.25), Inches(5.1), Inches(0.35), right_title, 14, INK, bold=True)
+    _add_textbox(slide, Inches(7.1), Inches(2.72), Inches(5.1), Inches(2.0), right_body or right_title, 12, MUTED)
+    if len(bullets) > 2:
+        _add_panel(slide, Inches(3.95), Inches(5.9), Inches(5.45), Inches(0.62), fill_color=ACCENT_SOFT)
+        _add_textbox(slide, Inches(4.15), Inches(6.08), Inches(5.0), Inches(0.2), bullets[2], 11, INK, align=PP_ALIGN.CENTER)
+
+
+def _render_matrix(slide, image_path: str, title: str, bullets: list[str]) -> None:
+    _apply_full_bleed_base(slide, image_path, veil_transparency=0.28)
+    _draw_title_band(slide, title, _kicker("matrix"))
+    _add_panel(slide, Inches(1.0), Inches(1.9), Inches(9.9), Inches(4.9))
+    cx = Inches(5.95)
+    cy = Inches(4.35)
+    vertical = slide.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, cx, Inches(2.18), cx, Inches(6.45))
+    vertical.line.color.rgb = LINE
+    horizontal = slide.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, Inches(1.28), cy, Inches(10.62), cy)
+    horizontal.line.color.rgb = LINE
+    axis_x = _add_textbox(slide, Inches(4.4), Inches(6.5), Inches(3.2), Inches(0.2), "Стратегическая привлекательность", 10, MUTED, align=PP_ALIGN.CENTER)
+    axis_y = _add_textbox(slide, Inches(0.45), Inches(3.7), Inches(0.4), Inches(1.0), "Операционная сложность", 10, MUTED, align=PP_ALIGN.CENTER)
+    axis_y.rotation = 270
+    positions = [
+        (Inches(1.35), Inches(2.3)),
+        (Inches(6.18), Inches(2.3)),
+        (Inches(1.35), Inches(4.78)),
+        (Inches(6.18), Inches(4.78)),
+    ]
+    matrix_defaults = ["Быстрые победы", "Стратегические ставки", "Операционные улучшения", "Зона контроля"]
+    for idx, bullet in enumerate((bullets + matrix_defaults)[:4]):
+        heading, body = _split_label(bullet or matrix_defaults[idx])
+        if not body or body.lower() == heading.lower():
+            body = "Приоритет и критерии реализации"
+        left, top = positions[idx]
+        tint = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, left - Inches(0.08), top - Inches(0.08), Inches(3.98), Inches(1.02))
+        tint.fill.solid()
+        tint.fill.fore_color.rgb = ACCENT_SOFT if idx in (0, 3) else WHITE
+        tint.fill.transparency = 0.08
+        tint.line.fill.background()
+        _add_textbox(slide, left, top, Inches(3.9), Inches(0.3), heading, 13, INK, bold=True)
+        _add_textbox(slide, left, top + Inches(0.32), Inches(3.9), Inches(0.62), body or heading, 10, MUTED)
+
+
+def _render_radial(slide, image_path: str, title: str, bullets: list[str]) -> None:
+    _apply_full_bleed_base(slide, image_path, veil_transparency=0.27)
+    _draw_title_band(slide, title, _kicker("radial"))
+    center_x = Inches(8.25)
+    center_y = Inches(4.35)
+    for radius, color in ((1.45, LINE), (1.05, ACCENT), (0.62, ACCENT_ALT)):
+        ring = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.OVAL, center_x - Inches(radius), center_y - Inches(radius), Inches(radius * 2), Inches(radius * 2))
+        ring.fill.background()
+        ring.line.color.rgb = color
+        ring.line.width = Pt(1.2)
+    core = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.OVAL, center_x - Inches(0.44), center_y - Inches(0.44), Inches(0.88), Inches(0.88))
+    core.fill.solid()
+    core.fill.fore_color.rgb = ACCENT
+    core.line.fill.background()
+    _add_textbox(slide, center_x - Inches(0.6), center_y - Inches(0.1), Inches(1.2), Inches(0.2), "Ядро", 12, WHITE, bold=True, align=PP_ALIGN.CENTER)
+    positions = [
+        (Inches(4.15), Inches(1.95)),
+        (Inches(9.6), Inches(1.95)),
+        (Inches(4.15), Inches(4.95)),
+        (Inches(9.6), Inches(4.95)),
+    ]
+    for idx, bullet in enumerate((bullets + [""] * 4)[:4]):
+        heading, body = _split_label(bullet or "Node")
+        left, top = positions[idx]
+        _add_panel(slide, left, top, Inches(3.1), Inches(1.35))
+        _add_textbox(slide, left + Inches(0.18), top + Inches(0.16), Inches(2.7), Inches(0.24), heading, 12, INK, bold=True)
+        _add_textbox(slide, left + Inches(0.18), top + Inches(0.46), Inches(2.7), Inches(0.45), body or heading, 10, MUTED)
+
+
+def _add_gradient_fallback_background(slide, seed: str) -> None:
+    values = _hash_values(seed or "fallback", 9, 0, 255)
+    c1 = RGBColor(18 + values[0] % 42, 32 + values[1] % 50, 60 + values[2] % 70)
+    c2 = RGBColor(28 + values[3] % 54, 70 + values[4] % 72, 112 + values[5] % 72)
+    c3 = RGBColor(116 + values[6] % 60, 96 + values[7] % 70, 72 + values[8] % 70)
+
+    base = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, 0, 0, SLIDE_W, SLIDE_H)
+    base.fill.solid()
+    base.fill.fore_color.rgb = c1
+    base.line.fill.background()
+
+    glow_right = slide.shapes.add_shape(
+        MSO_AUTO_SHAPE_TYPE.OVAL,
+        int(SLIDE_W * 0.47),
+        int(SLIDE_H * -0.08),
+        int(SLIDE_W * 0.7),
+        int(SLIDE_H * 1.08),
+    )
+    glow_right.fill.solid()
+    glow_right.fill.fore_color.rgb = c2
+    glow_right.fill.transparency = 0.42
+    glow_right.line.fill.background()
+
+    glow_bottom = slide.shapes.add_shape(
+        MSO_AUTO_SHAPE_TYPE.OVAL,
+        int(SLIDE_W * 0.45),
+        int(SLIDE_H * 0.42),
+        int(SLIDE_W * 0.65),
+        int(SLIDE_H * 0.7),
+    )
+    glow_bottom.fill.solid()
+    glow_bottom.fill.fore_color.rgb = c3
+    glow_bottom.fill.transparency = 0.52
+    glow_bottom.line.fill.background()
+
+
+def _add_background_layer(slide, image_path: str | None, seed: str) -> None:
+    if image_path and os.path.exists(image_path):
+        slide.shapes.add_picture(image_path, 0, 0, width=SLIDE_W, height=SLIDE_H)
+        return
+    _add_gradient_fallback_background(slide, seed)
+
+
+def _add_glass_panel(slide, *, width_ratio: float = 0.36, transparency: float = 0.32) -> int:
+    panel_width = int(SLIDE_W * width_ratio)
+    panel = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, 0, 0, panel_width, SLIDE_H)
+    panel.fill.solid()
+    panel.fill.fore_color.rgb = OVERLAY_PANEL
+    panel.fill.transparency = transparency
+    panel.line.fill.background()
+
+    divider = slide.shapes.add_shape(
+        MSO_AUTO_SHAPE_TYPE.RECTANGLE,
+        panel_width - Inches(0.02),
+        0,
+        Inches(0.02),
+        SLIDE_H,
+    )
+    divider.fill.solid()
+    divider.fill.fore_color.rgb = RGBColor(255, 255, 255)
+    divider.fill.transparency = 0.78
+    divider.line.fill.background()
+    return panel_width
+
+
+def _ui_trim(text: str, limit: int) -> str:
+    normalized = re.sub(r"\s+", " ", (text or "").strip()).strip(" .;:-")
+    if len(normalized) <= limit:
+        return normalized
+    cut = normalized[:limit]
+    pivot = max(cut.rfind("."), cut.rfind(":"), cut.rfind(","), cut.rfind(" "))
+    if pivot > int(limit * 0.55):
+        cut = cut[:pivot]
+    return cut.strip(" .;:-")
+
+
+def _overlay_bullets_for_left(layout: str, bullets: list[str]) -> list[str]:
+    base = _dedupe_and_shorten(bullets, max_len=108, max_items=6)
+    if not base:
+        return ["Ключевые тезисы слайда", "Контекст, выводы и действия"]
+
+    if layout == "timeline":
+        mapped = [_split_label(_ui_trim(item, 86))[0] for item in base]
+        return _dedupe_and_shorten(mapped, max_len=70, max_items=3)
+
+    if layout == "data_matrix":
+        summary = []
+        for item in base[:4]:
+            plan, reality = _split_matrix_row(item)
+            summary.append(f"{_ui_trim(plan, 42)} vs {_ui_trim(reality, 42)}")
+        return _dedupe_and_shorten(summary, max_len=88, max_items=3)
+
+    return _dedupe_and_shorten(base, max_len=96, max_items=3)
+
+
+def _render_left_text_overlay(slide, title: str, bullets: list[str], panel_width: int, layout: str) -> None:
+    content_left = Inches(0.62)
+    content_width = panel_width - Inches(1.0)
+
+    title_text = _ui_trim(title, 88)
+    title_size = 34 if len(title_text) > 58 else 36
+
+    _add_textbox(
+        slide,
+        content_left,
+        Inches(0.72),
+        content_width,
+        Inches(2.15),
+        title_text,
+        title_size,
+        TITLE_ON_DARK,
+        bold=True,
+    )
+
+    normalized = _overlay_bullets_for_left(layout, bullets)
+    if not normalized:
+        normalized = ["Ключевые тезисы слайда", "Контекст, выводы и действия"]
+
+    for idx, bullet in enumerate(normalized):
+        _add_textbox(
+            slide,
+            content_left,
+            Inches(2.88 + idx * 0.9),
+            content_width,
+            Inches(0.72),
+            f"• {_ui_trim(bullet, 96)}",
+            17,
+            BODY_ON_DARK,
+        )
+
+
+def _draw_split_infographic_right(slide, right_left, bullets: list[str]) -> None:
+    card_w = Inches(2.78)
+    card_h = Inches(1.62)
+    positions = [
+        (right_left + Inches(0.25), Inches(1.05)),
+        (right_left + Inches(3.25), Inches(1.05)),
+        (right_left + Inches(0.25), Inches(3.05)),
+        (right_left + Inches(3.25), Inches(3.05)),
+    ]
+    items = (_dedupe_and_shorten(bullets, max_len=92, max_items=4) + ["Insight", "Фактор", "Риск", "Решение"])[:4]
+    for idx, text in enumerate(items):
+        left, top = positions[idx]
+        card = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, left, top, card_w, card_h)
+        card.fill.solid()
+        card.fill.fore_color.rgb = CARD_BG
+        card.fill.transparency = 0.16
+        card.line.color.rgb = RGBColor(255, 255, 255)
+        card.line.transparency = 0.38
+        card.line.width = Pt(1.0)
+        accent = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, left + Inches(0.14), top + Inches(0.14), Inches(0.72), Inches(0.06))
+        accent.fill.solid()
+        accent.fill.fore_color.rgb = ACCENT if idx % 2 == 0 else ACCENT_ALT
+        accent.line.fill.background()
+        heading, body = _split_label(text)
+        _add_textbox(slide, left + Inches(0.2), top + Inches(0.3), card_w - Inches(0.35), Inches(0.38), _ui_trim(heading, 48), 13, CARD_TITLE, bold=True)
+        _add_textbox(slide, left + Inches(0.2), top + Inches(0.68), card_w - Inches(0.35), Inches(0.62), _ui_trim(body or heading, 72), 10, CARD_BODY)
+
+
+def _draw_timeline_right(slide, right_left, bullets: list[str]) -> None:
+    line_x = right_left + Inches(0.85)
+    line = slide.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, line_x, Inches(1.05), line_x, Inches(6.38))
+    line.line.color.rgb = ACCENT
+    line.line.transparency = 0.2
+    line.line.width = Pt(2.0)
+
+    steps = (_dedupe_and_shorten(bullets, max_len=92, max_items=4) + ["Диагностика", "Приоритизация", "Запуск", "Контроль"])[:4]
+    for idx, step in enumerate(steps):
+        heading, body = _split_label(step)
+        y = Inches(1.38 + idx * 1.3)
+        dot = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.OVAL, line_x - Inches(0.1), y - Inches(0.1), Inches(0.2), Inches(0.2))
+        dot.fill.solid()
+        dot.fill.fore_color.rgb = ACCENT if idx % 2 == 0 else ACCENT_ALT
+        dot.line.fill.background()
+
+        card = slide.shapes.add_shape(
+            MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE,
+            right_left + Inches(1.15),
+            y - Inches(0.3),
+            Inches(4.35),
+            Inches(0.9),
+        )
+        card.fill.solid()
+        card.fill.fore_color.rgb = CARD_BG
+        card.fill.transparency = 0.16
+        card.line.color.rgb = WHITE
+        card.line.transparency = 0.34
+        card.line.width = Pt(0.8)
+        _add_textbox(slide, right_left + Inches(1.33), y - Inches(0.16), Inches(3.95), Inches(0.34), f"{idx + 1}. {_ui_trim(heading, 52)}", 12, CARD_TITLE, bold=True)
+        _add_textbox(slide, right_left + Inches(1.33), y + Inches(0.16), Inches(3.95), Inches(0.3), _ui_trim(body or heading, 64), 9, CARD_BODY)
+
+
+def _split_matrix_row(text: str) -> tuple[str, str]:
+    parts = re.split(r"\s+(?:vs|VS|против)\s+|[|]|→|->|—", text or "", maxsplit=1)
+    if len(parts) == 2:
+        left = parts[0].strip(" .;:-")
+        right = parts[1].strip(" .;:-")
+        if left and right:
+            return left, right
+    heading, body = _split_label(text)
+    if body and body.lower() != heading.lower():
+        return heading, body
+    return heading or "План", "Реальность"
+
+
+def _draw_data_matrix_right(slide, right_left, bullets: list[str]) -> None:
+    grid_left = right_left + Inches(0.25)
+    grid_top = Inches(1.24)
+    grid_w = Inches(5.85)
+    grid_h = Inches(5.28)
+
+    frame = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, grid_left, grid_top, grid_w, grid_h)
+    frame.fill.solid()
+    frame.fill.fore_color.rgb = CARD_BG
+    frame.fill.transparency = 0.16
+    frame.line.color.rgb = WHITE
+    frame.line.transparency = 0.32
+    frame.line.width = Pt(1.2)
+
+    half_w = int(grid_w / 2)
+    mid_x = grid_left + half_w
+    vline = slide.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, mid_x, grid_top, mid_x, grid_top + grid_h)
+    vline.line.color.rgb = LINE
+    vline.line.transparency = 0.22
+    vline.line.width = Pt(1.0)
+
+    row_count = 4
+    row_h = int(grid_h / (row_count + 1))
+    for idx in range(1, row_count + 1):
+        y = grid_top + row_h * idx
+        hline = slide.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, grid_left, y, grid_left + grid_w, y)
+        hline.line.color.rgb = LINE
+        hline.line.transparency = 0.22
+        hline.line.width = Pt(0.8)
+
+    cell_w = half_w - Inches(0.3)
+    _add_textbox(slide, grid_left + Inches(0.15), grid_top + Inches(0.1), cell_w, Inches(0.35), "ПЛАН", 12, CARD_TITLE, bold=True, align=PP_ALIGN.CENTER)
+    _add_textbox(slide, mid_x + Inches(0.15), grid_top + Inches(0.1), cell_w, Inches(0.35), "РЕАЛЬНОСТЬ", 12, CARD_TITLE, bold=True, align=PP_ALIGN.CENTER)
+
+    rows = (_dedupe_and_shorten(bullets, max_len=92, max_items=4) + ["Цели", "Ресурсы", "Сроки", "Риски"])[:row_count]
+    for idx, raw in enumerate(rows):
+        plan, reality = _split_matrix_row(raw)
+        y = grid_top + row_h * (idx + 1) + Inches(0.1)
+        _add_textbox(slide, grid_left + Inches(0.15), y, cell_w, Inches(0.72), _ui_trim(plan, 58), 10, CARD_BODY)
+        _add_textbox(slide, mid_x + Inches(0.15), y, cell_w, Inches(0.72), _ui_trim(reality, 58), 10, CARD_BODY)
+
+
+def _draw_hero_concept_right(slide, right_left) -> None:
+    cx = right_left + Inches(3.4)
+    cy = Inches(3.8)
+    for radius, trans in ((1.6, 0.72), (1.1, 0.78), (0.66, 0.82)):
+        ring = slide.shapes.add_shape(
+            MSO_AUTO_SHAPE_TYPE.OVAL,
+            cx - Inches(radius),
+            cy - Inches(radius),
+            Inches(radius * 2),
+            Inches(radius * 2),
+        )
+        ring.fill.background()
+        ring.line.color.rgb = WHITE
+        ring.line.transparency = trans
+        ring.line.width = Pt(2.0 if radius > 1 else 1.4)
+
+    core = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.OVAL, cx - Inches(0.22), cy - Inches(0.22), Inches(0.44), Inches(0.44))
+    core.fill.solid()
+    core.fill.fore_color.rgb = WHITE
+    core.line.fill.background()
+    tags = [
+        ("Контекст", Inches(-1.55), Inches(-1.45)),
+        ("Факторы", Inches(1.15), Inches(-1.2)),
+        ("Решения", Inches(1.2), Inches(1.15)),
+    ]
+    for label, dx, dy in tags:
+        bx = cx + dx
+        by = cy + dy
+        conn = slide.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, cx, cy, bx + Inches(0.78), by + Inches(0.22))
+        conn.line.color.rgb = WHITE
+        conn.line.transparency = 0.45
+        conn.line.width = Pt(1.0)
+        box = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, bx, by, Inches(1.55), Inches(0.48))
+        box.fill.solid()
+        box.fill.fore_color.rgb = CARD_BG
+        box.fill.transparency = 0.24
+        box.line.color.rgb = WHITE
+        box.line.transparency = 0.32
+        box.line.width = Pt(0.8)
+        _add_textbox(slide, bx + Inches(0.15), by + Inches(0.12), Inches(1.2), Inches(0.24), label, 10, CARD_TITLE, bold=True, align=PP_ALIGN.CENTER)
+
+
+def _render_hybrid_overlay_slide(slide, slide_data: dict, slide_number: int, image_path: str | None) -> None:
+    title = _extract_title(slide_data, slide_number)
+    bullets = _extract_bullets(slide_data)
+    layout = _layout_type(slide_data, slide_number)
+    image_prompt = str(slide_data.get("image_prompt") or slide_data.get("visual_meta_prompt") or title).strip()
+
+    _add_background_layer(slide, image_path, seed=f"{title}|{image_prompt}|{layout}")
+    panel_width = _add_glass_panel(slide, width_ratio=0.36, transparency=0.32)
+    _render_left_text_overlay(slide, title, bullets, panel_width, layout)
+
+    right_left = panel_width + Inches(0.32)
+    if layout == "data_matrix":
+        _draw_data_matrix_right(slide, right_left, bullets)
+    elif layout == "timeline":
+        _draw_timeline_right(slide, right_left, bullets)
+    elif layout == "hero_concept":
+        _draw_hero_concept_right(slide, right_left)
+    else:
+        _draw_split_infographic_right(slide, right_left, bullets)
+
+
+def _render_slide(slide, slide_data: dict, slide_number: int, image_path: str | None) -> None:
+    _render_hybrid_overlay_slide(slide, slide_data, slide_number, image_path)
+
+
+def _add_fallback_slide(prs: Presentation, slide_number: int, title: str = "Ошибка генерации") -> None:
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    _set_slide_background(slide)
+    _add_panel(slide, int(prs.slide_width * 0.12), int(prs.slide_height * 0.2), int(prs.slide_width * 0.76), int(prs.slide_height * 0.32))
+    _add_textbox(slide, Inches(2.4), Inches(2.6), Inches(8.5), Inches(0.5), f"{title} · Слайд {slide_number}", 20, RGBColor(180, 30, 30), bold=True, align=PP_ALIGN.CENTER)
+
+
+async def build_pptx_from_json(json_string: str, output_filename: str) -> str:
+    generated_image_paths: list[str] = []
+    try:
+        cleaned_json = _clean_json_string(json_string)
+        if not cleaned_json:
+            raise ValueError("Empty slide JSON")
+
+        payload = json.loads(cleaned_json)
+        slides = _normalize_slides(payload)
+        if not slides:
+            raise ValueError("No slides found in JSON")
+
+        output_dir = os.path.dirname(output_filename)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+
+        prs = Presentation()
+        prs.slide_width = SLIDE_W
+        prs.slide_height = SLIDE_H
+        image_success_count = 0
+        rendered_count = 0
+
+        for index, slide_data in enumerate(slides):
+            slide_number = int(slide_data.get("slide_number") or index + 1)
+            image_prompt = str(
+                slide_data.get("image_prompt")
+                or slide_data.get("visual_meta_prompt")
+                or slide_data.get("title")
+                or ""
+            ).strip()
+            image_path = None
+            try:
+                image_path = await generate_slide_image(image_prompt, slide_number)
+            except Exception as image_exc:
+                print(f"⚠️ Slide {slide_number}: image generation error: {image_exc}")
+
+            if image_path and os.path.exists(image_path):
+                generated_image_paths.append(image_path)
+                image_success_count += 1
+            else:
+                image_path = None
+
+            slide = prs.slides.add_slide(prs.slide_layouts[6])
+            try:
+                _render_slide(slide, slide_data, slide_number, image_path)
+                rendered_count += 1
+            except Exception as render_exc:
+                print(f"⚠️ Slide {slide_number}: render error: {render_exc}")
+                _set_slide_background(slide)
+                _add_panel(
+                    slide,
+                    int(prs.slide_width * 0.08),
+                    int(prs.slide_height * 0.16),
+                    int(prs.slide_width * 0.84),
+                    int(prs.slide_height * 0.68),
+                    fill_color=WHITE,
+                    transparency=0.04,
+                )
+                _add_textbox(
+                    slide,
+                    Inches(1.18),
+                    Inches(1.12),
+                    Inches(10.8),
+                    Inches(0.72),
+                    _extract_title(slide_data, slide_number),
+                    30,
+                    INK,
+                    bold=True,
+                )
+                for idx, bullet in enumerate(_extract_bullets(slide_data)[:4]):
+                    _add_textbox(slide, Inches(1.25), Inches(2.1 + idx * 0.8), Inches(10.3), Inches(0.52), f"• {bullet}", 18, MUTED)
+
+            if index < len(slides) - 1:
+                await asyncio.sleep(1)
+
+        if len(prs.slides) == 0 or rendered_count == 0:
+            raise ValueError("No slides were created")
+
+        prs.save(output_filename)
+        print(
+            f"Presentation saved: rendered={rendered_count}/{len(slides)} "
+            f"image_bg={image_success_count}/{len(slides)}"
+        )
+        return output_filename
+    except Exception as exc:
+        raise ValueError(f"Failed to build presentation: {exc}") from exc
+    finally:
+        for p in generated_image_paths:
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass

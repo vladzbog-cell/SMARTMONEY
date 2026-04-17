@@ -1,0 +1,152 @@
+import asyncio
+import re
+
+from artemox_client import (
+    ARTEMOX_MODEL,
+    ARTEMOX_QUOTA_EXCEEDED_SENTINEL,
+    get_artemox_client,
+)
+
+MAX_INPUT_CHARS = 45000
+RETRY_INPUT_CHARS = 15000
+
+STYLE_INSTRUCTIONS = {
+    "academic": (
+        "Визуальный стиль: строгий академический / корпоративный отчёт. "
+        "Доминируют тёмно-синий, белый, серый. Чёткая типографика, инфографика, "
+        "диаграммы и цифры в центре внимания. Фоны — абстрактная архитектура, геометрия, свет."
+    ),
+    "pitch": (
+        "Визуальный стиль: питч стартапа. "
+        "Яркие контрастные цвета, крупные заголовки, фотореалистичные 3D-объекты, "
+        "минимум текста, максимум визуального удара. Каждый слайд = одна мощная мысль."
+    ),
+    "creative": (
+        "Визуальный стиль: креативный / арт-журнал. "
+        "Нестандартные ракурсы, коллажная эстетика, сочные цвета, асимметрия. "
+        "Смешивай фото, иллюстрации, абстрактные 3D-элементы."
+    ),
+    "auto": (
+        "Визуальный стиль: на усмотрение ИИ. "
+        "Сам определи идеальный стиль под тему. Подбери палитру и настроение."
+    ),
+}
+
+SYSTEM_PROMPT = (
+    "Ты — Арт-директор мирового уровня. Твоя задача — превратить текстовый материал "
+    "в серию готовых инфографических постеров (слайдов) формата 16:9.\n\n"
+    "Ты НЕ создаёшь текст для PowerPoint. Ты придумываешь подробные промпты для "
+    "генератора картинок, чтобы тот НАРИСОВАЛ готовый слайд с текстом прямо на картинке.\n\n"
+    "Создай от 3 до 5 слайдов (для оптимизации нагрузки). "
+    "Каждая ключевая мысль, факт, цифра или аргумент заслуживают отдельный слайд.\n\n"
+    "Верни строго валидный JSON-массив (не объект!) без markdown и без пояснений. Формат:\n"
+    '[{"slide_number": 1, "image_prompt": "..."}, {"slide_number": 2, "image_prompt": "..."}, ...]\n\n'
+    "Правила для image_prompt:\n"
+    "1. Каждый промпт описывает ГОТОВЫЙ инфографический постер 16:9 с текстом.\n"
+    "2. ОБЯЗАТЕЛЬНО укажи, какой именно текст должен быть написан на картинке — "
+    "заголовки, тезисы, цифры, подписи. Используй формулировку типа: "
+    "'crisp bold typography reads: [ТЕКСТ]', 'large heading text: [ТЕКСТ]', "
+    "'smaller subtitle text below: [ТЕКСТ]'.\n"
+    "3. Опиши композицию: где расположен текст, где визуальные элементы "
+    "(3D-объекты, фото, иконки, графики, абстрактные фигуры).\n"
+    "4. Укажи цветовую палитру, стиль освещения, настроение.\n"
+    "5. Запрещены: стоковые люди в офисе, рукопожатия, совещания. "
+    "Используй метафоры: архитектура, навигация, рост, механизмы, свет, пространство.\n"
+    "6. Первый слайд — яркий титульный. Последний — финальный с выводом или call-to-action.\n\n"
+    "Пример промпта для одного слайда:\n"
+    "'A highly professional presentation slide, 16:9 aspect ratio. "
+    "Dark navy blue gradient background. On the left side, crisp bold white typography reads: "
+    "\"ДЕМОГРАФИЯ МОСКВЫ 2024\". Below it, smaller light gray text: "
+    "\"Анализ ключевых тенденций и прогноз\". On the right side, a glowing 3D holographic "
+    "globe with data streams flowing around it. Clean minimalist layout, subtle grid lines, "
+    "corporate editorial style, high quality presentation graphic design, clean vector-like text.'\n\n"
+    "Адаптируй стиль под тему и пожелания пользователя. "
+    "Поддерживай визуальную связность между слайдами — единая палитра, стиль типографики, "
+    "тип визуальных элементов."
+)
+
+
+def _prepare_text_for_model(text_content: str, limit: int) -> str:
+    normalized = re.sub(r"\s+", " ", (text_content or "")).strip()
+    if len(normalized) <= limit:
+        return normalized
+
+    head_size = int(limit * 0.7)
+    tail_size = limit - head_size
+    return (
+        normalized[:head_size]
+        + "\n\n[... document truncated for analysis ...]\n\n"
+        + normalized[-tail_size:]
+    )
+
+
+def _clean_model_response(text: str) -> str:
+    cleaned = (text or "").strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.removeprefix("```json").removeprefix("```").strip()
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3].strip()
+    return cleaned
+
+
+def _extract_response_text(response) -> str:
+    text = _clean_model_response(getattr(response, "text", ""))
+    if text:
+        return text
+
+    print(f"Artemox returned empty text. Response object: {response}")
+    return ""
+
+
+def _run_model(prepared_text: str, style: str = "auto") -> str:
+    client = get_artemox_client()
+    if client is None:
+        return ""
+
+    style_block = STYLE_INSTRUCTIONS.get(style, STYLE_INSTRUCTIONS["auto"])
+
+    prompt = (
+        f"{SYSTEM_PROMPT}\n\n"
+        f"{style_block}\n\n"
+        f"Исходный материал для анализа:\n{prepared_text}"
+    )
+    response = client.models.generate_content(
+        model=ARTEMOX_MODEL,
+        contents=prompt,
+    )
+    return _extract_response_text(response)
+
+
+def _generate_structure(text_content: str, style: str = "auto") -> str:
+    if get_artemox_client() is None or not text_content.strip():
+        return ""
+
+    prepared_text = _prepare_text_for_model(text_content, MAX_INPUT_CHARS)
+    print(f"Artemox input length: original={len(text_content)}, prepared={len(prepared_text)}")
+    retry_text = _prepare_text_for_model(text_content, RETRY_INPUT_CHARS)
+
+    try:
+        result = _run_model(prepared_text, style)
+        if result:
+            return result
+    except Exception as exc:
+        print(f"Artemox primary request failed: {exc}")
+        if "429" in str(exc) or "quota" in str(exc).lower() or "limit" in str(exc).lower():
+            return ARTEMOX_QUOTA_EXCEEDED_SENTINEL
+
+    print(f"Artemox retry with reduced input length={len(retry_text)}")
+    try:
+        return _run_model(retry_text, style)
+    except Exception as exc:
+        print(f"Artemox retry request failed: {exc}")
+        if "429" in str(exc) or "quota" in str(exc).lower() or "limit" in str(exc).lower():
+            return ARTEMOX_QUOTA_EXCEEDED_SENTINEL
+        return ""
+
+
+async def analyze_and_create_structure(text_content: str, style: str = "auto") -> str:
+    try:
+        return await asyncio.to_thread(_generate_structure, text_content, style)
+    except Exception as exc:
+        print(f"analyze_and_create_structure failed: {exc}")
+        return ""

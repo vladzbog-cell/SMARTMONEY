@@ -1,0 +1,131 @@
+import asyncio
+import base64
+import os
+from io import BytesIO
+
+from dotenv import load_dotenv
+from google.genai import types
+from PIL import Image
+
+from artemox_client import ARTEMOX_IMAGE_GENERATION_MODEL, get_artemox_client
+
+
+load_dotenv("keys.env")
+
+
+STYLE_ANCHOR = (
+    ", highly detailed professional presentation slide, clean typography, "
+    "perfect text rendering, infographic style, high quality presentation graphic design, "
+    "clean vector-like text"
+)
+
+
+def _build_image_prompt(prompt: str) -> str:
+    normalized = (prompt or "").strip()
+    return (
+        "Generate an image (no text response, only image): "
+        + normalized
+        + STYLE_ANCHOR
+    )
+
+
+def _validate_image(path: str) -> bool:
+    """Check that the saved file is a valid image."""
+    try:
+        with open(path, "rb") as f:
+            header = f.read(16)
+        # PNG magic: \x89PNG
+        if header[:4] == b"\x89PNG":
+            return True
+        # JPEG magic: \xff\xd8\xff
+        if header[:3] == b"\xff\xd8\xff":
+            return True
+        # WEBP magic: RIFF....WEBP
+        if header[:4] == b"RIFF" and header[8:12] == b"WEBP":
+            return True
+        print(f"⚠️ Unknown image format, header: {header[:16].hex()}")
+        return False
+    except Exception:
+        return False
+
+
+def _decode_inline_data(data: bytes | str) -> bytes:
+    raw = data if isinstance(data, bytes) else data.encode("utf-8")
+    if raw[:5] == b"iVBOR" or raw[:4] in (b"/9j/", b"UklG"):
+        return base64.b64decode(raw)
+    return raw
+
+
+async def generate_slide_image(prompt: str, slide_index: int) -> str | None:
+    if not prompt or prompt.strip().lower() in ("null", "none", ""):
+        return None
+
+    try:
+        client = get_artemox_client()
+        if client is None:
+            return None
+
+        final_prompt = _build_image_prompt(prompt)
+
+        os.makedirs("temp", exist_ok=True)
+        output_path = os.path.join("temp", f"slide_{slide_index}.png")
+
+        response = await asyncio.to_thread(
+            client.models.generate_content,
+            model=ARTEMOX_IMAGE_GENERATION_MODEL,
+            contents=[final_prompt],
+        )
+
+        candidates = getattr(response, "candidates", None) or []
+        if not candidates:
+            print(f"⚠️ No candidates in response for slide {slide_index}")
+            return None
+
+        parts = []
+        for candidate in candidates:
+            content = getattr(candidate, "content", None)
+            if content and getattr(content, "parts", None):
+                parts.extend(content.parts)
+
+        image_parts = []
+        for part in parts:
+            if getattr(part, "text", None):
+                print(f"ℹ️ Slide {slide_index} got text part: {part.text[:100]}")
+                continue
+
+            if getattr(part, "inline_data", None) is not None:
+                image_parts.append(part)
+
+        if not image_parts:
+            print(f"⚠️ No image data in response for slide {slide_index}")
+            return None
+
+        last_image_part = image_parts[-1]
+
+        try:
+            image = last_image_part.as_image()
+            image.save(output_path)
+        except Exception:
+            inline_data = getattr(last_image_part, "inline_data", None)
+            if inline_data is None or getattr(inline_data, "data", None) is None:
+                print(f"⚠️ Slide {slide_index}: image part has no inline_data")
+                return None
+
+            image_bytes = _decode_inline_data(inline_data.data)
+
+            try:
+                image = Image.open(BytesIO(image_bytes))
+                image.save(output_path)
+            except Exception:
+                with open(output_path, "wb") as f:
+                    f.write(image_bytes)
+
+        if _validate_image(output_path):
+            return output_path
+
+        print(f"⚠️ Slide {slide_index}: saved file is not a valid image")
+        os.remove(output_path)
+        return None
+    except Exception as e:
+        print(f"❌ Ошибка Imagen на слайде {slide_index}: {e}")
+        return None
