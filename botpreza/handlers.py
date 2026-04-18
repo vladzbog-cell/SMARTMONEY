@@ -19,6 +19,7 @@ from aiogram.fsm.state import State, StatesGroup
 from ai_service import analyze_and_create_structure
 from artemox_client import ARTEMOX_QUOTA_EXCEEDED_SENTINEL
 from audio_service import AUDIO_ENABLED, build_audio_overview
+from outline_service import build_outline_markdown
 from content_extractor import (
     ARTEMOX_MEDIA_QUOTA_EXCEEDED_SENTINEL,
     extract_context_from_media,
@@ -334,6 +335,13 @@ async def on_style_chosen(callback: CallbackQuery, state: FSMContext):
             return
 
         formatted_result = _normalize_result(result)
+
+        try:
+            outline_md = build_outline_markdown(formatted_result)
+            if outline_md:
+                await bot.send_message(chat_id, outline_md, parse_mode="Markdown")
+        except Exception:
+            logging.exception("Failed to send outline preview")
 
         await bot.edit_message_text(
             "🎨 Рисую фоны, раскладываю карточки, матрицы и статистику по слайдам...",
