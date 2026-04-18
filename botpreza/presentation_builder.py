@@ -50,6 +50,17 @@ TS_SMALL = 10              # supporting / caption
 TS_MICRO = 8               # footer / source badge
 LINE_SPACING_BODY = 1.18   # breathing room for multi-line body copy
 
+# Editorial canvas palette (NotebookLM-inspired)
+CANVAS = RGBColor(247, 243, 233)            # warm cream background
+HEADLINE_INK = RGBColor(18, 28, 52)         # deep navy serif headline
+BODY_INK = RGBColor(44, 56, 78)             # primary body ink
+SECONDARY_INK = RGBColor(110, 118, 132)     # kicker, meta, captions
+HAIRLINE = RGBColor(204, 198, 184)          # thin rule under headline
+COPPER = RGBColor(196, 108, 62)             # rare accent (numerals, highlight)
+CARD_SURFACE = RGBColor(252, 248, 238)      # callout box fill
+CARD_BORDER = RGBColor(214, 206, 190)       # callout box border
+WATERMARK = RGBColor(160, 160, 150)         # bottom-right logo mark
+
 
 def _clean_json_string(json_string: str) -> str:
     cleaned = (json_string or "").strip()
@@ -110,11 +121,24 @@ def _normalize_bullet_lines(value) -> list[str]:
     if isinstance(value, list):
         result = []
         for item in value:
+            if isinstance(item, dict):
+                nested = ""
+                for key in ("text", "value", "label", "title", "body", "content", "point"):
+                    candidate = item.get(key)
+                    if isinstance(candidate, str) and candidate.strip():
+                        nested = candidate.strip()
+                        break
+                if not nested:
+                    continue
+                item = nested
+            elif isinstance(item, (list, tuple)):
+                item = " ".join(str(x) for x in item if isinstance(x, (str, int, float)))
             text = str(item or "").strip()
-            if text and text.lower() not in ("null", "none"):
+            if text and text.lower() not in ("null", "none") and not text.startswith("{"):
                 cleaned = re.sub(r"^\d+\.\s*", "", text.lstrip("-• ").strip())
                 cleaned = re.sub(r"\s+", " ", cleaned).strip(" .;:-")
-                result.append(cleaned)
+                if cleaned:
+                    result.append(cleaned)
         return result
 
     text = str(value or "").strip()
@@ -401,7 +425,7 @@ def _hash_values(seed: str, count: int, min_val: int, max_val: int) -> list[int]
 def _set_slide_background(slide) -> None:
     fill = slide.background.fill
     fill.solid()
-    fill.fore_color.rgb = BG
+    fill.fore_color.rgb = CANVAS
 
 
 def _add_grid(slide, left, top, width, height, step_x=Inches(0.42), step_y=Inches(0.34), opacity=0.55):
@@ -1017,7 +1041,6 @@ def _draw_cover_right(slide, right_left, slide_data: dict, title: str) -> None:
     panel.line.transparency = 0.42
     panel.line.width = Pt(1.0)
 
-    _add_textbox(slide, mark_left + Inches(0.45), mark_top + Inches(0.5), Inches(3.5), Inches(0.35), "BRIEF", TS_SMALL + 1, WHITE, bold=True)
     _add_textbox(
         slide,
         mark_left + Inches(0.45),
@@ -1047,13 +1070,6 @@ def _draw_cover_right(slide, right_left, slide_data: dict, title: str) -> None:
             italic=True,
         )
 
-    badge_top = mark_top + mark_h - Inches(0.95)
-    badge = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, mark_left + Inches(0.45), badge_top, Inches(2.7), Inches(0.6))
-    badge.fill.solid()
-    badge.fill.fore_color.rgb = ACCENT
-    badge.fill.transparency = 0.1
-    badge.line.fill.background()
-    _add_textbox(slide, mark_left + Inches(0.6), badge_top + Inches(0.14), Inches(2.4), Inches(0.32), "NotebookLM-grade brief", 12, WHITE, bold=True)
 
 
 def _draw_agenda_right(slide, right_left, bullets: list[str]) -> None:
@@ -1378,8 +1394,508 @@ def _render_hybrid_overlay_slide(slide, slide_data: dict, slide_number: int, ima
         _draw_split_infographic_right(slide, right_left, bullets)
 
 
-def _render_slide(slide, slide_data: dict, slide_number: int, image_path: str | None) -> None:
-    _render_hybrid_overlay_slide(slide, slide_data, slide_number, image_path)
+# ─── Editorial (NotebookLM-inspired) render path ────────────────────────────
+# Cream canvas, top-left navy serif headline, thin hairline rule, and a single
+# editorial content area below. No AI backgrounds, no glass panels, no dual
+# title columns — just type-led composition.
+
+EDITORIAL_MARGIN_L = Inches(0.85)
+EDITORIAL_MARGIN_R = Inches(0.85)
+EDITORIAL_TITLE_TOP = Inches(0.55)
+EDITORIAL_TITLE_W = Inches(9.6)
+EDITORIAL_TITLE_H = Inches(1.55)
+EDITORIAL_RULE_Y = Inches(2.35)
+EDITORIAL_CONTENT_TOP = Inches(2.70)
+EDITORIAL_CONTENT_H = Inches(4.20)
+EDITORIAL_CONTENT_W = SLIDE_W - EDITORIAL_MARGIN_L - EDITORIAL_MARGIN_R
+
+
+_KICKER_LABELS = {
+    "cover": "ОБЛОЖКА",
+    "agenda": "ПОВЕСТКА",
+    "context": "КОНТЕКСТ",
+    "key_findings": "КЛЮЧЕВЫЕ ВЫВОДЫ",
+    "stat_highlight": "ЦИФРА",
+    "quote_highlight": "ЦИТАТА",
+    "comparison": "СРАВНЕНИЕ",
+    "takeaways": "ВЫВОДЫ",
+    "hero_concept": "КОНЦЕПЦИЯ",
+    "timeline": "ХРОНОЛОГИЯ",
+    "data_matrix": "МАТРИЦА",
+    "split_infographic": "РАЗБОР",
+}
+
+
+def _editorial_kicker_text(layout: str, slide_number: int, total_slides: int | None = None) -> str:
+    label = _KICKER_LABELS.get(layout, "РАЗДЕЛ")
+    if total_slides and total_slides > 0:
+        return f"{label}  ·  {slide_number:02d} / {total_slides:02d}"
+    return f"{label}  ·  {slide_number:02d}"
+
+
+def _editorial_headline(slide, title: str, kicker: str | None) -> None:
+    if kicker:
+        _add_textbox(
+            slide,
+            EDITORIAL_MARGIN_L,
+            Inches(0.38),
+            EDITORIAL_TITLE_W,
+            Inches(0.22),
+            kicker,
+            TS_SMALL,
+            SECONDARY_INK,
+            bold=True,
+            font_name=FONT_BASE,
+            line_spacing=1.0,
+        )
+    _add_textbox(
+        slide,
+        EDITORIAL_MARGIN_L,
+        EDITORIAL_TITLE_TOP + Inches(0.12),
+        EDITORIAL_TITLE_W,
+        EDITORIAL_TITLE_H,
+        _ui_trim(title, 110, ellipsis=False),
+        38,
+        HEADLINE_INK,
+        bold=True,
+        font_name=FONT_DISPLAY,
+        line_spacing=1.08,
+    )
+    rule = slide.shapes.add_connector(
+        MSO_CONNECTOR.STRAIGHT,
+        EDITORIAL_MARGIN_L,
+        EDITORIAL_RULE_Y,
+        SLIDE_W - EDITORIAL_MARGIN_R,
+        EDITORIAL_RULE_Y,
+    )
+    rule.line.color.rgb = HAIRLINE
+    rule.line.width = Pt(0.75)
+
+
+def _editorial_watermark(slide) -> None:
+    _add_textbox(
+        slide,
+        SLIDE_W - Inches(1.7),
+        SLIDE_H - Inches(0.6),
+        Inches(1.4),
+        Inches(0.22),
+        "SMARTMONEY",
+        TS_MICRO,
+        WATERMARK,
+        bold=True,
+        align=PP_ALIGN.RIGHT,
+        font_name=FONT_BASE,
+        line_spacing=1.0,
+    )
+
+
+def _editorial_bullet_list(slide, bullets: list[str], *, left=None, top=None, width=None, height=None, numbered: bool = True) -> None:
+    if not bullets:
+        return
+    left = left if left is not None else EDITORIAL_MARGIN_L
+    top = top if top is not None else EDITORIAL_CONTENT_TOP
+    width = width if width is not None else EDITORIAL_CONTENT_W
+    height = height if height is not None else EDITORIAL_CONTENT_H
+    items = bullets[:5]
+    count = len(items)
+    row_h = height / max(count, 1)
+    for idx, raw in enumerate(items):
+        row_top = top + row_h * idx
+        marker_w = Inches(0.55)
+        marker_text = f"{idx + 1:02d}" if numbered else "•"
+        _add_textbox(
+            slide,
+            left,
+            row_top + Inches(0.06),
+            marker_w,
+            Inches(0.4),
+            marker_text,
+            TS_H2,
+            COPPER,
+            bold=True,
+            font_name=FONT_DISPLAY,
+            line_spacing=1.0,
+        )
+        _add_textbox(
+            slide,
+            left + marker_w,
+            row_top,
+            width - marker_w,
+            row_h,
+            _ui_trim(raw, 200),
+            TS_H2,
+            BODY_INK,
+            font_name=FONT_BASE,
+            line_spacing=1.3,
+        )
+        if idx < count - 1:
+            sep_y = row_top + row_h - Inches(0.04)
+            sep = slide.shapes.add_connector(
+                MSO_CONNECTOR.STRAIGHT,
+                left + marker_w,
+                sep_y,
+                left + width,
+                sep_y,
+            )
+            sep.line.color.rgb = HAIRLINE
+            sep.line.width = Pt(0.5)
+            sep.line.transparency = 0.35
+
+
+def _editorial_callout_card(slide, left, top, width, height, *, label: str, body: str, label_color=COPPER) -> None:
+    card = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, left, top, width, height)
+    card.fill.solid()
+    card.fill.fore_color.rgb = CARD_SURFACE
+    card.line.color.rgb = CARD_BORDER
+    card.line.width = Pt(0.75)
+    _add_textbox(
+        slide,
+        left + Inches(0.25),
+        top + Inches(0.18),
+        width - Inches(0.5),
+        Inches(0.28),
+        label.upper(),
+        TS_SMALL,
+        label_color,
+        bold=True,
+        font_name=FONT_BASE,
+        line_spacing=1.0,
+    )
+    _add_textbox(
+        slide,
+        left + Inches(0.25),
+        top + Inches(0.5),
+        width - Inches(0.5),
+        height - Inches(0.65),
+        _ui_trim(body, 280),
+        TS_BODY + 1,
+        BODY_INK,
+        font_name=FONT_BASE,
+        line_spacing=1.28,
+    )
+
+
+def _draw_cover_editorial(slide, title: str, slide_data: dict) -> None:
+    # The cover shows a subtitle/lead and a meta block instead of bullets.
+    subtitle = _extract_subtitle(slide_data)
+    if subtitle:
+        _add_textbox(
+            slide,
+            EDITORIAL_MARGIN_L,
+            EDITORIAL_CONTENT_TOP + Inches(0.1),
+            EDITORIAL_CONTENT_W * 0.7,
+            Inches(2.0),
+            _ui_trim(subtitle, 240),
+            TS_H1,
+            BODY_INK,
+            font_name=FONT_DISPLAY,
+            italic=True,
+            line_spacing=1.35,
+        )
+    bullets = _extract_bullets(slide_data)
+    if bullets:
+        lead_top = EDITORIAL_CONTENT_TOP + Inches(2.35)
+        _add_textbox(
+            slide,
+            EDITORIAL_MARGIN_L,
+            lead_top,
+            EDITORIAL_CONTENT_W,
+            Inches(0.25),
+            "О ЧЁМ ПРЕЗЕНТАЦИЯ",
+            TS_SMALL,
+            SECONDARY_INK,
+            bold=True,
+            font_name=FONT_BASE,
+            line_spacing=1.0,
+        )
+        lines = [f"·  {b}" for b in bullets[:3]]
+        _add_textbox(
+            slide,
+            EDITORIAL_MARGIN_L,
+            lead_top + Inches(0.32),
+            EDITORIAL_CONTENT_W,
+            Inches(1.4),
+            "\n".join(lines),
+            TS_BODY + 1,
+            BODY_INK,
+            font_name=FONT_BASE,
+            line_spacing=1.42,
+        )
+
+
+def _draw_agenda_editorial(slide, title: str, slide_data: dict, bullets: list[str]) -> None:
+    _editorial_bullet_list(slide, bullets, numbered=True)
+
+
+def _draw_context_editorial(slide, title: str, slide_data: dict, bullets: list[str]) -> None:
+    lead = _extract_subtitle(slide_data)
+    content_top = EDITORIAL_CONTENT_TOP
+    content_h = EDITORIAL_CONTENT_H
+    if lead:
+        _add_textbox(
+            slide,
+            EDITORIAL_MARGIN_L,
+            content_top,
+            EDITORIAL_CONTENT_W * 0.95,
+            Inches(1.1),
+            _ui_trim(lead, 220),
+            TS_H1,
+            BODY_INK,
+            font_name=FONT_DISPLAY,
+            italic=True,
+            line_spacing=1.32,
+        )
+        content_top = content_top + Inches(1.2)
+        content_h = content_h - Inches(1.2)
+    _editorial_bullet_list(
+        slide,
+        bullets,
+        top=content_top,
+        height=content_h,
+        numbered=False,
+    )
+
+
+def _draw_key_findings_editorial(slide, title: str, slide_data: dict, bullets: list[str]) -> None:
+    _editorial_bullet_list(slide, bullets, numbered=True)
+
+
+def _draw_takeaways_editorial(slide, title: str, slide_data: dict, bullets: list[str]) -> None:
+    if not bullets:
+        return
+    items = bullets[:4]
+    card_w = EDITORIAL_CONTENT_W / 2 - Inches(0.2)
+    card_h = EDITORIAL_CONTENT_H / 2 - Inches(0.15)
+    for idx, item in enumerate(items):
+        col = idx % 2
+        row = idx // 2
+        left = EDITORIAL_MARGIN_L + col * (card_w + Inches(0.4))
+        top = EDITORIAL_CONTENT_TOP + row * (card_h + Inches(0.3))
+        _editorial_callout_card(
+            slide,
+            left,
+            top,
+            card_w,
+            card_h,
+            label=f"ВЫВОД {idx + 1:02d}",
+            body=item,
+        )
+
+
+def _draw_stat_highlight_editorial(slide, title: str, slide_data: dict, bullets: list[str]) -> None:
+    stats = _extract_stats(slide_data) or []
+    if not stats:
+        # fall back to bullets if structured stats are missing
+        _editorial_bullet_list(slide, bullets, numbered=False)
+        return
+    items = stats[:3]
+    col_w = EDITORIAL_CONTENT_W / len(items)
+    for idx, stat in enumerate(items):
+        value = str(stat.get("value") or stat.get("figure") or stat.get("number") or "").strip()
+        label = str(stat.get("label") or stat.get("caption") or stat.get("title") or "").strip()
+        desc = str(stat.get("description") or stat.get("note") or stat.get("context") or "").strip()
+        left = EDITORIAL_MARGIN_L + idx * col_w
+        _add_textbox(
+            slide,
+            left + Inches(0.1),
+            EDITORIAL_CONTENT_TOP + Inches(0.1),
+            col_w - Inches(0.2),
+            Inches(1.7),
+            _ui_trim(value, 18, ellipsis=False) or "—",
+            72,
+            COPPER,
+            bold=True,
+            font_name=FONT_DISPLAY,
+            line_spacing=1.0,
+        )
+        if label:
+            _add_textbox(
+                slide,
+                left + Inches(0.1),
+                EDITORIAL_CONTENT_TOP + Inches(1.85),
+                col_w - Inches(0.2),
+                Inches(0.6),
+                _ui_trim(label, 80, ellipsis=False),
+                TS_H2,
+                HEADLINE_INK,
+                bold=True,
+                font_name=FONT_BASE,
+                line_spacing=1.2,
+            )
+        if desc:
+            _add_textbox(
+                slide,
+                left + Inches(0.1),
+                EDITORIAL_CONTENT_TOP + Inches(2.55),
+                col_w - Inches(0.2),
+                Inches(1.4),
+                _ui_trim(desc, 180),
+                TS_BODY,
+                BODY_INK,
+                font_name=FONT_BASE,
+                line_spacing=1.35,
+            )
+
+
+def _draw_quote_highlight_editorial(slide, title: str, slide_data: dict, bullets: list[str]) -> None:
+    quotes = _extract_quotes(slide_data) or []
+    if quotes:
+        q = quotes[0]
+        quote_text = str(q.get("text") or q.get("quote") or q.get("body") or "").strip()
+        author = str(q.get("author") or q.get("speaker") or q.get("source") or "").strip()
+    else:
+        quote_text = bullets[0] if bullets else ""
+        author = ""
+    if not quote_text:
+        return
+    _add_textbox(
+        slide,
+        EDITORIAL_MARGIN_L + Inches(0.1),
+        EDITORIAL_CONTENT_TOP + Inches(0.1),
+        Inches(0.6),
+        Inches(1.2),
+        "\u201C",
+        96,
+        COPPER,
+        bold=True,
+        font_name=FONT_DISPLAY,
+        line_spacing=0.8,
+    )
+    _add_textbox(
+        slide,
+        EDITORIAL_MARGIN_L + Inches(0.85),
+        EDITORIAL_CONTENT_TOP + Inches(0.2),
+        EDITORIAL_CONTENT_W - Inches(1.0),
+        Inches(3.0),
+        _ui_trim(quote_text, 320),
+        TS_H1 + 4,
+        HEADLINE_INK,
+        font_name=FONT_DISPLAY,
+        italic=True,
+        line_spacing=1.32,
+    )
+    if author:
+        _add_textbox(
+            slide,
+            EDITORIAL_MARGIN_L + Inches(0.85),
+            EDITORIAL_CONTENT_TOP + Inches(3.3),
+            EDITORIAL_CONTENT_W - Inches(1.0),
+            Inches(0.4),
+            f"— {author}",
+            TS_H2,
+            SECONDARY_INK,
+            font_name=FONT_BASE,
+            line_spacing=1.2,
+        )
+
+
+def _draw_comparison_editorial(slide, title: str, slide_data: dict, bullets: list[str]) -> None:
+    pairs = [_split_matrix_row(b) for b in bullets[:5]] if bullets else []
+    col_w = EDITORIAL_CONTENT_W / 2 - Inches(0.2)
+    for col_idx, header in enumerate(["ДО", "ПОСЛЕ"]):
+        left = EDITORIAL_MARGIN_L + col_idx * (col_w + Inches(0.4))
+        _add_textbox(
+            slide,
+            left,
+            EDITORIAL_CONTENT_TOP,
+            col_w,
+            Inches(0.3),
+            header,
+            TS_SMALL,
+            COPPER if col_idx == 1 else SECONDARY_INK,
+            bold=True,
+            font_name=FONT_BASE,
+            line_spacing=1.0,
+        )
+        lines = []
+        for pair in pairs:
+            left_text, right_text = pair
+            value = right_text if col_idx == 1 else left_text
+            if value:
+                lines.append(f"·  {value}")
+        if not lines and bullets:
+            lines = [f"·  {b}" for b in bullets[:4]]
+        _add_textbox(
+            slide,
+            left,
+            EDITORIAL_CONTENT_TOP + Inches(0.5),
+            col_w,
+            EDITORIAL_CONTENT_H - Inches(0.5),
+            "\n".join(lines),
+            TS_BODY + 2,
+            BODY_INK,
+            font_name=FONT_BASE,
+            line_spacing=1.4,
+        )
+
+
+def _draw_fallback_editorial(slide, title: str, slide_data: dict, bullets: list[str]) -> None:
+    lead = _extract_subtitle(slide_data)
+    content_top = EDITORIAL_CONTENT_TOP
+    content_h = EDITORIAL_CONTENT_H
+    if lead:
+        _add_textbox(
+            slide,
+            EDITORIAL_MARGIN_L,
+            content_top,
+            EDITORIAL_CONTENT_W * 0.95,
+            Inches(1.1),
+            _ui_trim(lead, 220),
+            TS_H1,
+            BODY_INK,
+            font_name=FONT_DISPLAY,
+            italic=True,
+            line_spacing=1.32,
+        )
+        content_top = content_top + Inches(1.2)
+        content_h = content_h - Inches(1.2)
+    _editorial_bullet_list(slide, bullets, top=content_top, height=content_h, numbered=False)
+
+
+_EDITORIAL_LAYOUT_DISPATCH = {
+    "cover": _draw_cover_editorial,
+    "agenda": _draw_agenda_editorial,
+    "context": _draw_context_editorial,
+    "key_findings": _draw_key_findings_editorial,
+    "stat_highlight": _draw_stat_highlight_editorial,
+    "quote_highlight": _draw_quote_highlight_editorial,
+    "comparison": _draw_comparison_editorial,
+    "takeaways": _draw_takeaways_editorial,
+}
+
+
+def _render_editorial_slide(slide, slide_data: dict, slide_number: int, total_slides: int | None) -> None:
+    _set_slide_background(slide)
+    title = _extract_title(slide_data, slide_number)
+    bullets = _extract_bullets(slide_data)
+    layout = _layout_type(slide_data, slide_number)
+    kicker = _editorial_kicker_text(layout, slide_number, total_slides)
+
+    if layout == "cover":
+        # cover uses the kicker as a short tagline ("ОБЛОЖКА · 01 / 08")
+        _editorial_headline(slide, title, kicker)
+    else:
+        _editorial_headline(slide, title, kicker)
+
+    drawer = _EDITORIAL_LAYOUT_DISPATCH.get(layout)
+    if drawer is None:
+        _draw_fallback_editorial(slide, title, slide_data, bullets)
+    else:
+        try:
+            if drawer is _draw_cover_editorial:
+                drawer(slide, title, slide_data)
+            else:
+                drawer(slide, title, slide_data, bullets)
+        except Exception as exc:
+            print(f"⚠️ editorial drawer {drawer.__name__} failed: {exc}")
+            _draw_fallback_editorial(slide, title, slide_data, bullets)
+
+    _editorial_watermark(slide)
+
+
+def _render_slide(slide, slide_data: dict, slide_number: int, image_path: str | None, total_slides: int | None = None) -> None:
+    # image_path is ignored in the editorial redesign — kept for signature stability
+    _render_editorial_slide(slide, slide_data, slide_number, total_slides)
     title = _extract_title(slide_data, slide_number)
     bullets = _extract_bullets(slide_data)
     layout = _layout_type(slide_data, slide_number)
@@ -1444,28 +1960,31 @@ def _draw_source_badge(slide, meta: dict | None, slide_number: int, total_slides
 
     _add_textbox(
         slide,
-        Inches(0.45),
-        SLIDE_H - Inches(0.38),
+        Inches(0.85),
+        SLIDE_H - Inches(0.42),
         Inches(9.5),
-        Inches(0.26),
+        Inches(0.24),
         badge_text,
         TS_MICRO,
-        BODY_ON_DARK,
+        SECONDARY_INK,
+        bold=True,
+        font_name=FONT_BASE,
         line_spacing=1.0,
     )
 
     page_text = f"{slide_number:02d} / {total_slides:02d}"
     _add_textbox(
         slide,
-        SLIDE_W - Inches(1.55),
-        SLIDE_H - Inches(0.38),
-        Inches(1.3),
-        Inches(0.26),
+        SLIDE_W - Inches(3.4),
+        SLIDE_H - Inches(0.42),
+        Inches(1.6),
+        Inches(0.24),
         page_text,
         TS_MICRO,
-        BODY_ON_DARK,
+        SECONDARY_INK,
         bold=True,
         align=PP_ALIGN.RIGHT,
+        font_name=FONT_BASE,
         line_spacing=1.0,
     )
 
@@ -1507,25 +2026,12 @@ async def build_pptx_from_json(json_string: str, output_filename: str, meta: dic
                 or slide_data.get("title")
                 or ""
             ).strip()
+            # Editorial redesign: no AI-generated backgrounds.
             image_path = None
-            try:
-                image_path = await generate_slide_image(image_prompt, slide_number)
-            except Exception as image_exc:
-                print(f"⚠️ Slide {slide_number}: image generation error: {image_exc}")
-
-            if image_path and os.path.exists(image_path):
-                generated_image_paths.append(image_path)
-                if _image_is_acceptable(image_path):
-                    image_success_count += 1
-                else:
-                    print(f"⚠️ Slide {slide_number}: image failed quality filter, falling back to gradient")
-                    image_path = None
-            else:
-                image_path = None
 
             slide = prs.slides.add_slide(prs.slide_layouts[6])
             try:
-                _render_slide(slide, slide_data, slide_number, image_path)
+                _render_slide(slide, slide_data, slide_number, image_path, total_slides=len(slides))
                 _draw_source_badge(slide, meta, slide_number, len(slides))
                 rendered_count += 1
             except Exception as render_exc:
