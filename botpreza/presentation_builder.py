@@ -31,6 +31,19 @@ CARD_BG = RGBColor(250, 252, 255)
 CARD_TITLE = RGBColor(24, 36, 58)
 CARD_BODY = RGBColor(72, 86, 112)
 
+# Typography tokens — one source of truth for size + family hierarchy.
+FONT_DISPLAY = "Georgia"   # editorial serif for hero/cover titles
+FONT_BASE = "Arial"        # universal body / UI
+FONT_MONO = "Consolas"     # rare: stats caption micro-text
+TS_DISPLAY = 48            # huge hero title (cover panel)
+TS_HEADLINE = 30           # main title in most layouts
+TS_H1 = 22                 # section lead / quote body
+TS_H2 = 16                 # subtitle / lead paragraph
+TS_BODY = 12               # body copy
+TS_SMALL = 10              # supporting / caption
+TS_MICRO = 8               # footer / source badge
+LINE_SPACING_BODY = 1.18   # breathing room for multi-line body copy
+
 
 def _clean_json_string(json_string: str) -> str:
     cleaned = (json_string or "").strip()
@@ -403,7 +416,22 @@ def _add_grid(slide, left, top, width, height, step_x=Inches(0.42), step_y=Inche
         y += step_y
 
 
-def _add_textbox(slide, left, top, width, height, text, size, color, *, bold=False, align=PP_ALIGN.LEFT):
+def _add_textbox(
+    slide,
+    left,
+    top,
+    width,
+    height,
+    text,
+    size,
+    color,
+    *,
+    bold=False,
+    align=PP_ALIGN.LEFT,
+    font_name: str = FONT_BASE,
+    line_spacing: float | None = None,
+    italic: bool = False,
+):
     box = slide.shapes.add_textbox(left, top, width, height)
     frame = box.text_frame
     frame.clear()
@@ -411,11 +439,14 @@ def _add_textbox(slide, left, top, width, height, text, size, color, *, bold=Fal
     frame.vertical_anchor = MSO_ANCHOR.TOP
     paragraph = frame.paragraphs[0]
     paragraph.alignment = align
+    if line_spacing is not None:
+        paragraph.line_spacing = line_spacing
     run = paragraph.add_run()
     run.text = text
-    run.font.name = "Arial"
+    run.font.name = font_name
     run.font.size = Pt(size)
     run.font.bold = bold
+    run.font.italic = italic
     run.font.color.rgb = color
     return box
 
@@ -772,18 +803,20 @@ def _render_left_text_overlay(slide, title: str, bullets: list[str], panel_width
     content_width = panel_width - Inches(1.0)
 
     title_text = _ui_trim(title, 88)
-    title_size = 34 if len(title_text) > 58 else 36
+    title_size = 32 if len(title_text) > 58 else 36
 
     _add_textbox(
         slide,
         content_left,
         Inches(0.72),
         content_width,
-        Inches(2.15),
+        Inches(2.3),
         title_text,
         title_size,
         TITLE_ON_DARK,
         bold=True,
+        font_name=FONT_DISPLAY,
+        line_spacing=1.08,
     )
 
     normalized = _overlay_bullets_for_left(layout, bullets)
@@ -794,12 +827,13 @@ def _render_left_text_overlay(slide, title: str, bullets: list[str], panel_width
         _add_textbox(
             slide,
             content_left,
-            Inches(2.88 + idx * 0.9),
+            Inches(3.0 + idx * 0.95),
             content_width,
-            Inches(0.72),
+            Inches(0.82),
             f"• {_ui_trim(bullet, 96)}",
-            17,
+            TS_H2,
             BODY_ON_DARK,
+            line_spacing=LINE_SPACING_BODY,
         )
 
 
@@ -974,12 +1008,35 @@ def _draw_cover_right(slide, right_left, slide_data: dict, title: str) -> None:
     panel.line.transparency = 0.42
     panel.line.width = Pt(1.0)
 
-    _add_textbox(slide, mark_left + Inches(0.45), mark_top + Inches(0.5), Inches(3.5), Inches(0.35), "BRIEF", 11, WHITE, bold=True)
-    _add_textbox(slide, mark_left + Inches(0.45), mark_top + Inches(0.95), mark_w - Inches(0.9), Inches(1.3), _ui_trim(title, 90), 30, WHITE, bold=True)
+    _add_textbox(slide, mark_left + Inches(0.45), mark_top + Inches(0.5), Inches(3.5), Inches(0.35), "BRIEF", TS_SMALL + 1, WHITE, bold=True)
+    _add_textbox(
+        slide,
+        mark_left + Inches(0.45),
+        mark_top + Inches(0.95),
+        mark_w - Inches(0.9),
+        Inches(2.0),
+        _ui_trim(title, 90),
+        TS_DISPLAY,
+        WHITE,
+        bold=True,
+        font_name=FONT_DISPLAY,
+        line_spacing=1.05,
+    )
 
     subtitle = _extract_subtitle(slide_data)
     if subtitle:
-        _add_textbox(slide, mark_left + Inches(0.45), mark_top + Inches(2.55), mark_w - Inches(0.9), Inches(1.0), _ui_trim(subtitle, 140), 14, BODY_ON_DARK)
+        _add_textbox(
+            slide,
+            mark_left + Inches(0.45),
+            mark_top + Inches(3.05),
+            mark_w - Inches(0.9),
+            Inches(1.4),
+            _ui_trim(subtitle, 160),
+            TS_H2,
+            BODY_ON_DARK,
+            line_spacing=LINE_SPACING_BODY,
+            italic=True,
+        )
 
     badge_top = mark_top + mark_h - Inches(0.95)
     badge = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, mark_left + Inches(0.45), badge_top, Inches(2.7), Inches(0.6))
@@ -1132,9 +1189,31 @@ def _draw_stat_highlight_right(slide, right_left, slide_data: dict, bullets: lis
     value = headline_stat.get("value") or (bullets[0] if bullets else "—")
     label = headline_stat.get("label") or (bullets[1] if len(bullets) > 1 else "Главный показатель слайда")
 
-    _add_textbox(slide, panel_left + Inches(0.5), panel_top + Inches(0.4), panel_w - Inches(1.0), Inches(0.35), "MAIN NUMBER", 11, ACCENT_ALT, bold=True)
-    _add_textbox(slide, panel_left + Inches(0.5), panel_top + Inches(0.85), panel_w - Inches(1.0), Inches(2.2), _ui_trim(value, 18), 72, CARD_TITLE, bold=True)
-    _add_textbox(slide, panel_left + Inches(0.5), panel_top + Inches(3.15), panel_w - Inches(1.0), Inches(0.95), _ui_trim(label, 160), 16, CARD_BODY)
+    _add_textbox(slide, panel_left + Inches(0.5), panel_top + Inches(0.4), panel_w - Inches(1.0), Inches(0.35), "MAIN NUMBER", TS_SMALL + 1, ACCENT_ALT, bold=True)
+    _add_textbox(
+        slide,
+        panel_left + Inches(0.5),
+        panel_top + Inches(0.85),
+        panel_w - Inches(1.0),
+        Inches(2.2),
+        _ui_trim(value, 18),
+        72,
+        CARD_TITLE,
+        bold=True,
+        font_name=FONT_DISPLAY,
+        line_spacing=0.95,
+    )
+    _add_textbox(
+        slide,
+        panel_left + Inches(0.5),
+        panel_top + Inches(3.15),
+        panel_w - Inches(1.0),
+        Inches(1.1),
+        _ui_trim(label, 160),
+        TS_H2,
+        CARD_BODY,
+        line_spacing=LINE_SPACING_BODY,
+    )
 
     support = _dedupe_and_shorten(bullets[1:] if headline_stat.get("value") else bullets[2:], max_len=110, max_items=2)
     for idx, item in enumerate(support):
@@ -1162,10 +1241,23 @@ def _draw_quote_highlight_right(slide, right_left, slide_data: dict, bullets: li
     card.line.transparency = 0.34
     card.line.width = Pt(1.0)
 
-    _add_textbox(slide, panel_left + Inches(0.45), panel_top + Inches(0.35), Inches(1.4), Inches(0.6), "“", 72, ACCENT, bold=True)
+    _add_textbox(slide, panel_left + Inches(0.45), panel_top + Inches(0.35), Inches(1.4), Inches(0.8), "“", 96, ACCENT, bold=True, font_name=FONT_DISPLAY)
 
     quote_text = _ui_trim(quote.get("text") or "Нет точной цитаты в источнике.", 260)
-    _add_textbox(slide, panel_left + Inches(0.5), panel_top + Inches(1.1), panel_w - Inches(1.0), Inches(2.8), quote_text, 20, CARD_TITLE, bold=True)
+    _add_textbox(
+        slide,
+        panel_left + Inches(0.5),
+        panel_top + Inches(1.3),
+        panel_w - Inches(1.0),
+        Inches(2.8),
+        quote_text,
+        TS_H1,
+        CARD_TITLE,
+        bold=False,
+        font_name=FONT_DISPLAY,
+        italic=True,
+        line_spacing=1.25,
+    )
 
     author = _ui_trim(quote.get("author") or "Источник", 90)
     _add_hairline_rule(slide, panel_left + Inches(0.5), panel_top + Inches(4.3), panel_left + Inches(2.5), panel_top + Inches(4.3), color=ACCENT, transparency=0.0, width=1.2)
