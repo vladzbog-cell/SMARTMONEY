@@ -274,7 +274,7 @@ async def on_style_chosen(callback: CallbackQuery, state: FSMContext):
     temp_pptx_path = None
     try:
         await bot.edit_message_text(
-            "🧠 Анализирую материал и формирую структуру слайдов...",
+            "🧠 Выстраиваю повествование: контекст → находки → цифры → выводы...",
             chat_id=chat_id, message_id=status_msg_id,
         )
 
@@ -321,7 +321,7 @@ async def on_style_chosen(callback: CallbackQuery, state: FSMContext):
         formatted_result = _normalize_result(result)
 
         await bot.edit_message_text(
-            "🎨 Рисую фоны через шлюз и готовлю визуальные подложки...",
+            "🎨 Рисую фоны, раскладываю карточки, матрицы и статистику по слайдам...",
             chat_id=chat_id, message_id=status_msg_id,
         )
 
@@ -353,12 +353,12 @@ async def on_style_chosen(callback: CallbackQuery, state: FSMContext):
             raise RuntimeError(build_error or "build failed")
 
         await bot.edit_message_text(
-            "✅ Презентация готова! Отправляю...",
+            "✅ Презентация готова! Отправляю файл с заметками докладчика для каждого слайда...",
             chat_id=chat_id, message_id=status_msg_id,
         )
         await bot.send_document(chat_id, FSInputFile(file_path))
         await bot.edit_message_text(
-            "✅ Презентация готова и отправлена.",
+            "✅ Презентация готова и отправлена. Откройте режим заметок, чтобы увидеть speaker notes к каждому слайду.",
             chat_id=chat_id, message_id=status_msg_id,
         )
     except Exception as e:
