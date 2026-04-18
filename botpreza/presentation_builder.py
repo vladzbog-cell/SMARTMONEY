@@ -1381,6 +1381,59 @@ def _render_slide(slide, slide_data: dict, slide_number: int, image_path: str | 
     _attach_speaker_notes(slide, notes_text)
 
 
+SOURCE_KIND_LABELS = {
+    "pdf": "PDF",
+    "docx": "DOCX",
+    "url": "Web",
+    "youtube": "YouTube",
+    "image": "Изображение",
+    "video": "Видео",
+    "voice": "Voice-сообщение",
+    "audio": "Аудиозапись",
+    "text": "Текст",
+}
+
+
+def _draw_source_badge(slide, meta: dict | None, slide_number: int, total_slides: int) -> None:
+    source_kind = (meta or {}).get("source_kind") or "text"
+    source_label = (meta or {}).get("source_label") or ""
+    kind_text = SOURCE_KIND_LABELS.get(source_kind, "Текст")
+
+    parts = [f"ПО МАТЕРИАЛУ · {kind_text.upper()}"]
+    if source_label:
+        trimmed = _ui_trim(str(source_label), 48, ellipsis=True)
+        if trimmed:
+            parts.append(trimmed)
+    badge_text = "  ·  ".join(parts)
+
+    _add_textbox(
+        slide,
+        Inches(0.45),
+        SLIDE_H - Inches(0.38),
+        Inches(9.5),
+        Inches(0.26),
+        badge_text,
+        TS_MICRO,
+        BODY_ON_DARK,
+        line_spacing=1.0,
+    )
+
+    page_text = f"{slide_number:02d} / {total_slides:02d}"
+    _add_textbox(
+        slide,
+        SLIDE_W - Inches(1.55),
+        SLIDE_H - Inches(0.38),
+        Inches(1.3),
+        Inches(0.26),
+        page_text,
+        TS_MICRO,
+        BODY_ON_DARK,
+        bold=True,
+        align=PP_ALIGN.RIGHT,
+        line_spacing=1.0,
+    )
+
+
 def _add_fallback_slide(prs: Presentation, slide_number: int, title: str = "Ошибка генерации") -> None:
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     _set_slide_background(slide)
@@ -1388,7 +1441,7 @@ def _add_fallback_slide(prs: Presentation, slide_number: int, title: str = "Ош
     _add_textbox(slide, Inches(2.4), Inches(2.6), Inches(8.5), Inches(0.5), f"{title} · Слайд {slide_number}", 20, RGBColor(180, 30, 30), bold=True, align=PP_ALIGN.CENTER)
 
 
-async def build_pptx_from_json(json_string: str, output_filename: str) -> str:
+async def build_pptx_from_json(json_string: str, output_filename: str, meta: dict | None = None) -> str:
     generated_image_paths: list[str] = []
     try:
         cleaned_json = _clean_json_string(json_string)
@@ -1433,6 +1486,7 @@ async def build_pptx_from_json(json_string: str, output_filename: str) -> str:
             slide = prs.slides.add_slide(prs.slide_layouts[6])
             try:
                 _render_slide(slide, slide_data, slide_number, image_path)
+                _draw_source_badge(slide, meta, slide_number, len(slides))
                 rendered_count += 1
             except Exception as render_exc:
                 print(f"⚠️ Slide {slide_number}: render error: {render_exc}")

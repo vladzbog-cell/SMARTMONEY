@@ -137,10 +137,14 @@ async def process_document(message: Message, bot: Bot, state: FSMContext):
         await status_msg.edit_text(f"⚙️ Файл скачан. Извлекаю текст из {file_name}...")
 
         text_content = ""
+        source_kind = "text"
+        source_label = file_name
         if file_name.lower().endswith('.pdf'):
             text_content = await extract_text_from_pdf(temp_path)
+            source_kind = "pdf"
         elif file_name.lower().endswith('.docx'):
             text_content = await extract_text_from_docx(temp_path)
+            source_kind = "docx"
         else:
             await status_msg.edit_text("❌ Я пока не умею читать этот формат файлов. Отправьте PDF или DOCX.")
             if os.path.exists(temp_path):
@@ -154,7 +158,12 @@ async def process_document(message: Message, bot: Bot, state: FSMContext):
             await status_msg.edit_text("❌ Не удалось извлечь текст. Возможно, файл пустой или состоит только из сложных картинок.")
             return
 
-        await state.update_data(extracted_text=text_content, status_msg_id=status_msg.message_id)
+        await state.update_data(
+            extracted_text=text_content,
+            status_msg_id=status_msg.message_id,
+            source_kind=source_kind,
+            source_label=source_label,
+        )
         await state.set_state(GenState.waiting_for_style)
 
         await status_msg.edit_text(
@@ -181,6 +190,8 @@ async def process_user_material(message: Message, state: FSMContext):
 
     try:
         extracted_text = None
+        source_kind = "text"
+        source_label = ""
 
         if message.photo:
             stage_name = "скачивания изображения"
@@ -188,6 +199,8 @@ async def process_user_material(message: Message, state: FSMContext):
             stage_name = "распознавания изображения"
             await status_message.edit_text("⚙️ Читаю содержимое документа...")
             extracted_text = await extract_context_from_media(temp_input_path, "image")
+            source_kind = "image"
+            source_label = "изображение"
         elif message.video:
             stage_name = "скачивания видео"
             temp_input_path = await _download_to_tempfile(
@@ -198,12 +211,16 @@ async def process_user_material(message: Message, state: FSMContext):
             stage_name = "анализа видео"
             await status_message.edit_text("⚙️ Анализирую видео и извлекаю смысловой контекст...")
             extracted_text = await extract_context_from_media(temp_input_path, "video")
+            source_kind = "video"
+            source_label = message.video.file_name or "видео"
         elif message.voice:
             stage_name = "скачивания голосового сообщения"
             temp_input_path = await _download_to_tempfile(message, message.voice.file_id, ".ogg")
             stage_name = "расшифровки аудио"
             await status_message.edit_text("⚙️ Читаю содержимое документа...")
             extracted_text = await extract_context_from_media(temp_input_path, "audio")
+            source_kind = "voice"
+            source_label = "голосовое"
         elif message.audio:
             stage_name = "скачивания аудиофайла"
             temp_input_path = await _download_to_tempfile(
@@ -214,6 +231,8 @@ async def process_user_material(message: Message, state: FSMContext):
             stage_name = "расшифровки аудио"
             await status_message.edit_text("⚙️ Читаю содержимое документа...")
             extracted_text = await extract_context_from_media(temp_input_path, "audio")
+            source_kind = "audio"
+            source_label = (message.audio.file_name if message.audio else "") or "аудио"
         elif message.text:
             stage_name = "извлечения текста"
             source_text = message.text.strip()
@@ -221,10 +240,16 @@ async def process_user_material(message: Message, state: FSMContext):
 
             if url and ("youtube.com" in url or "youtu.be" in url):
                 extracted_text = await extract_text_from_youtube(url)
+                source_kind = "youtube"
+                source_label = url
             elif url and url.startswith("http"):
                 extracted_text = await extract_text_from_url(url)
+                source_kind = "url"
+                source_label = url
             else:
                 extracted_text = source_text
+                source_kind = "text"
+                source_label = "текст в сообщении"
 
         if extracted_text == ARTEMOX_MEDIA_QUOTA_EXCEEDED_SENTINEL:
             await status_message.edit_text(
@@ -236,7 +261,12 @@ async def process_user_material(message: Message, state: FSMContext):
             await status_message.edit_text(f"❌ Ошибка на этапе {stage_name}.")
             return
 
-        await state.update_data(extracted_text=extracted_text, status_msg_id=status_message.message_id)
+        await state.update_data(
+            extracted_text=extracted_text,
+            status_msg_id=status_message.message_id,
+            source_kind=source_kind,
+            source_label=source_label,
+        )
         await state.set_state(GenState.waiting_for_style)
 
         await status_message.edit_text(
@@ -264,6 +294,8 @@ async def on_style_chosen(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     extracted_text = data.get("extracted_text", "")
     status_msg_id = data.get("status_msg_id")
+    source_kind = data.get("source_kind", "text")
+    source_label = data.get("source_label", "")
     await state.clear()
     await callback.answer()
 
@@ -359,7 +391,11 @@ async def on_style_chosen(callback: CallbackQuery, state: FSMContext):
                     f"🛠 Собираю презентацию (попытка {attempt}/{ARTEMOX_RETRY_ATTEMPTS})...",
                     chat_id=chat_id, message_id=status_msg_id,
                 )
-                file_path = await build_pptx_from_json(formatted_result, temp_pptx_path)
+                file_path = await build_pptx_from_json(
+                    formatted_result,
+                    temp_pptx_path,
+                    meta={"source_kind": source_kind, "source_label": source_label},
+                )
                 break
             except Exception as build_exc:
                 build_error = str(build_exc)
