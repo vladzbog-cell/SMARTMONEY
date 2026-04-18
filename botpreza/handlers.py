@@ -18,6 +18,7 @@ from aiogram.fsm.state import State, StatesGroup
 
 from ai_service import analyze_and_create_structure
 from artemox_client import ARTEMOX_QUOTA_EXCEEDED_SENTINEL
+from audio_service import AUDIO_ENABLED, build_audio_overview
 from content_extractor import (
     ARTEMOX_MEDIA_QUOTA_EXCEEDED_SENTINEL,
     extract_context_from_media,
@@ -99,6 +100,20 @@ def _normalize_result(result) -> str:
     if isinstance(result, str):
         return result
     return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+def _extract_slides_for_audio(formatted_result: str) -> list[dict]:
+    try:
+        payload = json.loads(formatted_result)
+    except Exception:
+        return []
+    if isinstance(payload, list):
+        return [s for s in payload if isinstance(s, dict)]
+    if isinstance(payload, dict):
+        slides = payload.get("slides")
+        if isinstance(slides, list):
+            return [s for s in slides if isinstance(s, dict)]
+    return []
 
 
 def _is_retryable_artemox_error(text: str) -> bool:
@@ -361,6 +376,39 @@ async def on_style_chosen(callback: CallbackQuery, state: FSMContext):
             "✅ Презентация готова и отправлена. Откройте режим заметок, чтобы увидеть speaker notes к каждому слайду.",
             chat_id=chat_id, message_id=status_msg_id,
         )
+
+        if AUDIO_ENABLED:
+            audio_path = None
+            try:
+                slides_for_audio = _extract_slides_for_audio(formatted_result)
+                if slides_for_audio:
+                    await bot.edit_message_text(
+                        "🎙 Собираю аудио-обзор в стиле NotebookLM: двухголосный диалог...",
+                        chat_id=chat_id, message_id=status_msg_id,
+                    )
+                    audio_path = await build_audio_overview(slides_for_audio)
+            except Exception as audio_exc:
+                logging.exception("Audio overview failed: %s", audio_exc)
+                audio_path = None
+
+            if audio_path and os.path.exists(audio_path):
+                try:
+                    await bot.send_audio(
+                        chat_id,
+                        FSInputFile(audio_path),
+                        caption="🎧 Audio overview · host + guest",
+                    )
+                    await bot.edit_message_text(
+                        "✅ Презентация и аудио-обзор отправлены. Наслаждайтесь прослушиванием!",
+                        chat_id=chat_id, message_id=status_msg_id,
+                    )
+                except Exception:
+                    logging.exception("Failed to send audio overview")
+                finally:
+                    try:
+                        os.remove(audio_path)
+                    except OSError:
+                        pass
     except Exception as e:
         print(f"КРИТИЧЕСКАЯ ОШИБКА (on_style_chosen): {e}")
         logging.exception("Failed during generation after style choice")
