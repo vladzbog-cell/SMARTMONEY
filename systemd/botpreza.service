@@ -1,0 +1,18 @@
+[Unit]
+Description=Botpreza — Telegram PPTX generation bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/SMARTMONEY/botpreza
+EnvironmentFile=-/opt/SMARTMONEY/botpreza/keys.env
+ExecStart=/opt/SMARTMONEY/botpreza/venv/bin/python /opt/SMARTMONEY/botpreza/main.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/var/log/botpreza.log
+StandardError=append:/var/log/botpreza.log
+
+[Install]
+WantedBy=multi-user.target
