@@ -282,6 +282,51 @@ def _run_model(prepared_text: str, style: str = "auto") -> str:
     return _extract_response_text(response)
 
 
+def _call_gemini(prompt: str, model: str) -> str:
+    client = get_artemox_client()
+    if client is None:
+        return ""
+    response = client.models.generate_content(model=model, contents=prompt)
+    return _extract_response_text(response)
+
+
+def _run_extraction(prepared_text: str) -> str:
+    prompt = (
+        f"{EXTRACTION_PROMPT}\n\n"
+        f"Исходный материал:\n{prepared_text}"
+    )
+    return _call_gemini(prompt, EXTRACTION_MODEL)
+
+
+def _run_composition(evidence_json: str, style: str) -> str:
+    style_block = STYLE_INSTRUCTIONS.get(style, STYLE_INSTRUCTIONS["auto"])
+    reference_brief = get_reference_style_brief()
+    prompt = (
+        f"{COMPOSITION_PROMPT}\n\n"
+        f"{style_block}\n\n"
+        f"Визуальный ориентир по референсным презентациям:\n{reference_brief}\n\n"
+        f"Evidence brief (обязательное основание, JSON):\n{evidence_json}"
+    )
+    return _call_gemini(prompt, BRAIN_MODEL)
+
+
+def _run_grounding(slides_json: str, evidence_json: str) -> str:
+    prompt = (
+        f"{GROUNDING_PROMPT}\n\n"
+        f"Evidence brief:\n{evidence_json}\n\n"
+        f"Draft слайдов:\n{slides_json}"
+    )
+    return _call_gemini(prompt, GROUNDING_MODEL)
+
+
+async def _run_with_timeout(fn, *args, timeout: int = None) -> str:
+    timeout_sec = timeout or MODEL_TIMEOUT_SEC
+    return await asyncio.wait_for(
+        asyncio.to_thread(fn, *args),
+        timeout=timeout_sec,
+    )
+
+
 def _clean_bullet(text: str) -> str:
     cleaned = re.sub(r"\s+", " ", (text or "").strip())
     cleaned = cleaned.lstrip("-• ").strip(" .")
@@ -907,12 +952,87 @@ async def _run_model_with_timeout(prepared_text: str, style: str) -> str:
     )
 
 
+def _is_quota_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "429" in message or "quota" in message or "limit" in message
+
+
+def _evidence_brief_is_valid(evidence_json: str) -> bool:
+    try:
+        payload = json.loads(_clean_model_response(evidence_json))
+    except Exception:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    has_text = any(
+        bool(str(payload.get(key) or "").strip())
+        for key in ("topic", "thesis")
+    )
+    has_arrays = any(
+        isinstance(payload.get(key), list) and payload.get(key)
+        for key in ("key_facts", "outline", "numbers", "quotes", "takeaways")
+    )
+    return has_text or has_arrays
+
+
+async def _run_two_stage_pipeline(text_content: str, style: str) -> str:
+    prepared_text = _prepare_text_for_model(text_content, MAX_INPUT_CHARS)
+    print(
+        f"Two-stage pipeline: input len={len(text_content)}, prepared={len(prepared_text)}, "
+        f"extraction_model={EXTRACTION_MODEL}, brain_model={BRAIN_MODEL}, grounding_model={GROUNDING_MODEL}"
+    )
+
+    evidence_raw = await _run_with_timeout(_run_extraction, prepared_text)
+    evidence_raw = _clean_model_response(evidence_raw)
+    if not evidence_raw or not _evidence_brief_is_valid(evidence_raw):
+        print("Extraction stage produced empty/invalid evidence; falling back to single-stage prompt.")
+        return ""
+    print(f"Evidence brief length: {len(evidence_raw)}")
+
+    slides_raw = await _run_with_timeout(_run_composition, evidence_raw, style)
+    slides_raw = _clean_model_response(slides_raw)
+    if not slides_raw:
+        print("Composition stage produced empty output.")
+        return ""
+
+    if ENABLE_GROUNDING_CHECK:
+        try:
+            checked = await _run_with_timeout(_run_grounding, slides_raw, evidence_raw)
+            checked = _clean_model_response(checked)
+            if checked:
+                normalized = _normalize_model_structure(checked, style)
+                if normalized:
+                    return normalized
+            print("Grounding stage returned empty or invalid JSON, using composition output as-is.")
+        except asyncio.TimeoutError:
+            print("Grounding stage timed out, falling back to composition output.")
+        except Exception as exc:
+            print(f"Grounding stage failed ({exc}), falling back to composition output.")
+
+    normalized = _normalize_model_structure(slides_raw, style)
+    return normalized
+
+
 async def analyze_and_create_structure(text_content: str, style: str = "auto") -> str:
     if get_artemox_client() is None or not (text_content or "").strip():
         return _fallback_structure(text_content, style)
 
     prepared_text = _prepare_text_for_model(text_content, MAX_INPUT_CHARS)
     print(f"Artemox input length: original={len(text_content)}, prepared={len(prepared_text)}")
+
+    if TWO_STAGE_PIPELINE and not ULTRA_CHEAP_MODE:
+        try:
+            two_stage_result = await _run_two_stage_pipeline(text_content, style)
+            if two_stage_result:
+                return two_stage_result
+        except asyncio.TimeoutError:
+            print("Two-stage pipeline timed out, falling back to single-stage prompt.")
+        except Exception as exc:
+            print(f"Two-stage pipeline failed: {exc}")
+            if _is_quota_error(exc):
+                return ARTEMOX_QUOTA_EXCEEDED_SENTINEL
+            if _looks_like_gateway_block(exc) or _looks_like_auth_block(exc):
+                return _fallback_structure(text_content, style)
 
     try:
         result = await _run_model_with_timeout(prepared_text, style)
@@ -922,7 +1042,7 @@ async def analyze_and_create_structure(text_content: str, style: str = "auto") -
                 return normalized
     except Exception as exc:
         print(f"Artemox primary request failed: {exc}")
-        if "429" in str(exc) or "quota" in str(exc).lower() or "limit" in str(exc).lower():
+        if _is_quota_error(exc):
             return ARTEMOX_QUOTA_EXCEEDED_SENTINEL
         if _looks_like_gateway_block(exc) or _looks_like_auth_block(exc):
             return _fallback_structure(text_content, style)
@@ -940,7 +1060,7 @@ async def analyze_and_create_structure(text_content: str, style: str = "auto") -
                 return normalized
     except Exception as exc:
         print(f"Artemox retry request failed: {exc}")
-        if "429" in str(exc) or "quota" in str(exc).lower() or "limit" in str(exc).lower():
+        if _is_quota_error(exc):
             return ARTEMOX_QUOTA_EXCEEDED_SENTINEL
 
     return _fallback_structure(text_content, style)
