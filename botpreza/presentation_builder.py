@@ -174,8 +174,156 @@ def _kicker(layout: str) -> str:
         "comparison": "Сравнение сценариев",
         "matrix": "Матрица приоритетов",
         "radial": "Системная архитектура",
+        "cover": "Обложка",
+        "agenda": "Повестка",
+        "context": "Контекст",
+        "key_findings": "Ключевые находки",
+        "stat_highlight": "Главная цифра",
+        "quote_highlight": "Цитата из источника",
+        "takeaways": "Выводы и действия",
+        "hero_concept": "Стратегический обзор",
+        "split_infographic": "Ключевые темы",
+        "timeline": "Последовательность действий",
+        "data_matrix": "Матрица приоритетов",
     }
     return mapping.get(layout, "Аналитический слайд")
+
+
+def _extract_subtitle(slide_data: dict) -> str:
+    content_block = slide_data.get("content") if isinstance(slide_data.get("content"), dict) else {}
+    for source in (content_block, slide_data):
+        for key in ("subtitle", "lead", "dek", "kicker_text"):
+            value = str(source.get(key) or "").strip()
+            if value and value.lower() not in ("null", "none"):
+                return re.sub(r"\s+", " ", value).strip(" .;:-")[:200]
+    return ""
+
+
+def _extract_stats(slide_data: dict) -> list[dict]:
+    content_block = slide_data.get("content") if isinstance(slide_data.get("content"), dict) else {}
+    raw = None
+    for source in (content_block, slide_data):
+        for key in ("stats", "numbers", "metrics"):
+            candidate = source.get(key)
+            if isinstance(candidate, list) and candidate:
+                raw = candidate
+                break
+        if raw is not None:
+            break
+    if not raw:
+        return []
+    stats: list[dict] = []
+    for item in raw:
+        if isinstance(item, dict):
+            value = re.sub(r"\s+", " ", str(item.get("value") or item.get("number") or "")).strip()[:24]
+            label = re.sub(r"\s+", " ", str(item.get("label") or item.get("caption") or item.get("description") or "")).strip()[:90]
+        else:
+            text = re.sub(r"\s+", " ", str(item or "")).strip()
+            match = re.match(r"(\S+?)\s*[-—:]\s*(.+)", text)
+            if match:
+                value, label = match.group(1)[:24], match.group(2)[:90]
+            else:
+                value, label = "", text[:90]
+        if value or label:
+            stats.append({"value": value, "label": label})
+        if len(stats) >= 4:
+            break
+    return stats
+
+
+def _extract_quotes(slide_data: dict) -> list[dict]:
+    content_block = slide_data.get("content") if isinstance(slide_data.get("content"), dict) else {}
+    raw = None
+    for source in (content_block, slide_data):
+        for key in ("quotes", "citations"):
+            candidate = source.get(key)
+            if isinstance(candidate, list) and candidate:
+                raw = candidate
+                break
+        if raw is not None:
+            break
+    if not raw:
+        return []
+    quotes: list[dict] = []
+    for item in raw:
+        if isinstance(item, dict):
+            text = re.sub(r"\s+", " ", str(item.get("text") or item.get("quote") or "")).strip()[:240]
+            author = re.sub(r"\s+", " ", str(item.get("author") or item.get("source") or "")).strip()[:90]
+        else:
+            text = re.sub(r"\s+", " ", str(item or "")).strip()[:240]
+            author = ""
+        if text:
+            quotes.append({"text": text, "author": author})
+        if len(quotes) >= 3:
+            break
+    return quotes
+
+
+def _extract_source_hint(slide_data: dict) -> str:
+    content_block = slide_data.get("content") if isinstance(slide_data.get("content"), dict) else {}
+    for source in (content_block, slide_data):
+        for key in ("source_hint", "source", "provenance"):
+            value = str(source.get(key) or "").strip()
+            if value and value.lower() not in ("null", "none"):
+                return re.sub(r"\s+", " ", value).strip(" .;:-")[:220]
+    return ""
+
+
+def _extract_speaker_notes(slide_data: dict) -> str:
+    content_block = slide_data.get("content") if isinstance(slide_data.get("content"), dict) else {}
+    for source in (slide_data, content_block):
+        value = source.get("speaker_notes") or source.get("notes")
+        if isinstance(value, list):
+            joined = " ".join(str(item or "").strip() for item in value if str(item or "").strip())
+        else:
+            joined = str(value or "").strip()
+        joined = re.sub(r"\s+", " ", joined).strip()
+        if joined and joined.lower() not in ("null", "none"):
+            return joined[:1800]
+    return ""
+
+
+def _compose_notes_text(slide_data: dict, title: str, layout: str, bullets: list[str]) -> str:
+    parts: list[str] = []
+    notes = _extract_speaker_notes(slide_data)
+    if notes:
+        parts.append(notes)
+    else:
+        fallback_lead = {
+            "cover": "Открываем презентацию и обозначаем тему.",
+            "agenda": "Озвучиваем повестку: какие блоки рассмотрим.",
+            "context": "Даём контекст и рамку темы.",
+            "key_findings": "Перечисляем ключевые находки.",
+            "stat_highlight": "Акцентируем внимание на главной цифре.",
+            "quote_highlight": "Усиляем идею цитатой из источника.",
+            "split_infographic": "Разбираем блок карточек по очереди.",
+            "timeline": "Проходим по этапам последовательно.",
+            "data_matrix": "Сравниваем план и реальность.",
+            "comparison": "Сравниваем два сценария.",
+            "takeaways": "Сводим выводы и следующие шаги.",
+            "hero_concept": "Формулируем ключевой концепт слайда.",
+        }.get(layout, "Комментируем слайд своими словами.")
+        bullet_hint = "; ".join(item for item in bullets[:3]) if bullets else ""
+        parts.append(f"{fallback_lead} Тема: «{title}».")
+        if bullet_hint:
+            parts.append(f"Тезисы: {bullet_hint}.")
+
+    source_hint = _extract_source_hint(slide_data)
+    if source_hint:
+        parts.append(f"Опора: {source_hint}")
+
+    return "\n\n".join(parts)[:1800]
+
+
+def _attach_speaker_notes(slide, notes_text: str) -> None:
+    if not notes_text:
+        return
+    try:
+        notes_slide = slide.notes_slide
+        text_frame = notes_slide.notes_text_frame
+        text_frame.text = notes_text
+    except Exception as exc:  # pragma: no cover - defensive
+        print(f"⚠️ Failed to attach speaker notes: {exc}")
 
 
 def _layout_type(slide_data: dict, slide_number: int) -> str:
@@ -189,13 +337,36 @@ def _layout_type(slide_data: dict, slide_number: int) -> str:
         "cards": "split_infographic",
         "process": "timeline",
         "chart_focus": "split_infographic",
-        "comparison": "split_infographic",
         "matrix": "data_matrix",
         "radial": "split_infographic",
+        "cover": "cover",
+        "title": "cover",
+        "opening": "cover",
+        "agenda": "agenda",
+        "toc": "agenda",
+        "outline": "agenda",
+        "context": "context",
+        "intro": "context",
+        "key_findings": "key_findings",
+        "findings": "key_findings",
+        "insights": "key_findings",
+        "stat_highlight": "stat_highlight",
+        "stat": "stat_highlight",
+        "number": "stat_highlight",
+        "metric": "stat_highlight",
+        "quote_highlight": "quote_highlight",
+        "quote": "quote_highlight",
+        "pull_quote": "quote_highlight",
+        "takeaways": "takeaways",
+        "summary": "takeaways",
+        "conclusion": "takeaways",
+        "closing": "takeaways",
+        "comparison": "comparison",
+        "versus": "comparison",
     }
     if raw in aliases:
         return aliases[raw]
-    cycle = ["hero_concept", "split_infographic", "timeline", "data_matrix"]
+    cycle = ["cover", "agenda", "context", "key_findings", "split_infographic", "timeline", "data_matrix", "takeaways"]
     return cycle[(slide_number - 1) % len(cycle)]
 
 
@@ -790,6 +961,285 @@ def _draw_hero_concept_right(slide, right_left) -> None:
         _add_textbox(slide, bx + Inches(0.15), by + Inches(0.12), Inches(1.2), Inches(0.24), label, 10, CARD_TITLE, bold=True, align=PP_ALIGN.CENTER)
 
 
+def _draw_cover_right(slide, right_left, slide_data: dict, title: str) -> None:
+    mark_left = right_left + Inches(0.4)
+    mark_top = Inches(1.1)
+    mark_w = Inches(5.8)
+    mark_h = Inches(5.4)
+    panel = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, mark_left, mark_top, mark_w, mark_h)
+    panel.fill.solid()
+    panel.fill.fore_color.rgb = CARD_BG
+    panel.fill.transparency = 0.22
+    panel.line.color.rgb = WHITE
+    panel.line.transparency = 0.42
+    panel.line.width = Pt(1.0)
+
+    _add_textbox(slide, mark_left + Inches(0.45), mark_top + Inches(0.5), Inches(3.5), Inches(0.35), "BRIEF", 11, WHITE, bold=True)
+    _add_textbox(slide, mark_left + Inches(0.45), mark_top + Inches(0.95), mark_w - Inches(0.9), Inches(1.3), _ui_trim(title, 90), 30, WHITE, bold=True)
+
+    subtitle = _extract_subtitle(slide_data)
+    if subtitle:
+        _add_textbox(slide, mark_left + Inches(0.45), mark_top + Inches(2.55), mark_w - Inches(0.9), Inches(1.0), _ui_trim(subtitle, 140), 14, BODY_ON_DARK)
+
+    badge_top = mark_top + mark_h - Inches(0.95)
+    badge = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, mark_left + Inches(0.45), badge_top, Inches(2.7), Inches(0.6))
+    badge.fill.solid()
+    badge.fill.fore_color.rgb = ACCENT
+    badge.fill.transparency = 0.1
+    badge.line.fill.background()
+    _add_textbox(slide, mark_left + Inches(0.6), badge_top + Inches(0.14), Inches(2.4), Inches(0.32), "NotebookLM-grade brief", 12, WHITE, bold=True)
+
+
+def _draw_agenda_right(slide, right_left, bullets: list[str]) -> None:
+    items = (_dedupe_and_shorten(bullets, max_len=90, max_items=6) + [
+        "Контекст и предпосылки",
+        "Ключевые находки",
+        "Сравнения и сценарии",
+        "Выводы и следующие шаги",
+    ])[:5]
+    card_left = right_left + Inches(0.25)
+    card_top = Inches(1.1)
+    card_w = Inches(6.0)
+    card_h = Inches(5.6)
+    card = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, card_left, card_top, card_w, card_h)
+    card.fill.solid()
+    card.fill.fore_color.rgb = CARD_BG
+    card.fill.transparency = 0.2
+    card.line.color.rgb = WHITE
+    card.line.transparency = 0.36
+    card.line.width = Pt(1.0)
+
+    _add_textbox(slide, card_left + Inches(0.4), card_top + Inches(0.35), card_w - Inches(0.8), Inches(0.35), "AGENDA", 11, ACCENT_ALT, bold=True)
+    _add_hairline_rule(slide, card_left + Inches(0.4), card_top + Inches(0.78), card_left + card_w - Inches(0.4), card_top + Inches(0.78), color=WHITE, transparency=0.4)
+
+    row_h = Inches(0.9)
+    start_y = card_top + Inches(1.0)
+    for idx, item in enumerate(items):
+        y = start_y + idx * row_h
+        number_box = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.OVAL, card_left + Inches(0.4), y, Inches(0.56), Inches(0.56))
+        number_box.fill.solid()
+        number_box.fill.fore_color.rgb = ACCENT if idx % 2 == 0 else ACCENT_ALT
+        number_box.line.fill.background()
+        _add_textbox(slide, card_left + Inches(0.4), y + Inches(0.09), Inches(0.56), Inches(0.4), f"{idx + 1:02d}", 14, WHITE, bold=True, align=PP_ALIGN.CENTER)
+        heading, body = _split_label(item)
+        _add_textbox(slide, card_left + Inches(1.15), y + Inches(0.02), card_w - Inches(1.55), Inches(0.34), _ui_trim(heading, 72), 14, CARD_TITLE, bold=True)
+        if body and body.lower() != heading.lower():
+            _add_textbox(slide, card_left + Inches(1.15), y + Inches(0.38), card_w - Inches(1.55), Inches(0.44), _ui_trim(body, 100), 10, CARD_BODY)
+
+
+def _draw_context_right(slide, right_left, slide_data: dict, bullets: list[str]) -> None:
+    lead_left = right_left + Inches(0.25)
+    lead_top = Inches(1.1)
+    lead_w = Inches(6.0)
+    lead_h = Inches(5.6)
+    panel = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, lead_left, lead_top, lead_w, lead_h)
+    panel.fill.solid()
+    panel.fill.fore_color.rgb = CARD_BG
+    panel.fill.transparency = 0.22
+    panel.line.color.rgb = WHITE
+    panel.line.transparency = 0.38
+    panel.line.width = Pt(1.0)
+
+    _add_textbox(slide, lead_left + Inches(0.45), lead_top + Inches(0.4), lead_w - Inches(0.9), Inches(0.32), "CONTEXT", 11, ACCENT_ALT, bold=True)
+
+    subtitle = _extract_subtitle(slide_data) or (bullets[0] if bullets else "")
+    if subtitle:
+        _add_textbox(slide, lead_left + Inches(0.45), lead_top + Inches(0.85), lead_w - Inches(0.9), Inches(1.6), _ui_trim(subtitle, 220), 18, CARD_TITLE, bold=True)
+
+    body_bullets = _dedupe_and_shorten(bullets[1:] or bullets, max_len=120, max_items=3)
+    for idx, item in enumerate(body_bullets):
+        y = lead_top + Inches(2.75 + idx * 0.85)
+        accent = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, lead_left + Inches(0.45), y + Inches(0.14), Inches(0.3), Inches(0.06))
+        accent.fill.solid()
+        accent.fill.fore_color.rgb = ACCENT if idx % 2 == 0 else ACCENT_ALT
+        accent.line.fill.background()
+        _add_textbox(slide, lead_left + Inches(0.9), y, lead_w - Inches(1.3), Inches(0.7), _ui_trim(item, 160), 12, CARD_BODY)
+
+    source_hint = _extract_source_hint(slide_data)
+    if source_hint:
+        hint_top = lead_top + lead_h - Inches(0.7)
+        _add_hairline_rule(slide, lead_left + Inches(0.45), hint_top - Inches(0.1), lead_left + lead_w - Inches(0.45), hint_top - Inches(0.1), color=WHITE, transparency=0.5)
+        _add_textbox(slide, lead_left + Inches(0.45), hint_top, lead_w - Inches(0.9), Inches(0.5), f"Источник: {_ui_trim(source_hint, 200)}", 9, BODY_ON_DARK)
+
+
+def _draw_key_findings_right(slide, right_left, slide_data: dict, bullets: list[str]) -> None:
+    stats = _extract_stats(slide_data)
+    grid_left = right_left + Inches(0.2)
+    grid_top = Inches(1.05)
+    grid_w = Inches(6.1)
+    grid_h = Inches(5.65)
+
+    frame = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, grid_left, grid_top, grid_w, grid_h)
+    frame.fill.solid()
+    frame.fill.fore_color.rgb = CARD_BG
+    frame.fill.transparency = 0.22
+    frame.line.color.rgb = WHITE
+    frame.line.transparency = 0.36
+    frame.line.width = Pt(1.0)
+
+    _add_textbox(slide, grid_left + Inches(0.4), grid_top + Inches(0.35), grid_w - Inches(0.8), Inches(0.32), "KEY FINDINGS", 11, ACCENT_ALT, bold=True)
+
+    stat_positions = [
+        (grid_left + Inches(0.35), grid_top + Inches(0.9)),
+        (grid_left + Inches(3.2), grid_top + Inches(0.9)),
+        (grid_left + Inches(0.35), grid_top + Inches(2.45)),
+        (grid_left + Inches(3.2), grid_top + Inches(2.45)),
+    ]
+    stat_items = (stats + [{"value": "", "label": ""}] * 4)[:4]
+    has_any_stat = any(s.get("value") or s.get("label") for s in stats[:4])
+    if has_any_stat:
+        for idx, stat in enumerate(stat_items):
+            left, top = stat_positions[idx]
+            if not (stat.get("value") or stat.get("label")):
+                continue
+            tile = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, left, top, Inches(2.7), Inches(1.4))
+            tile.fill.solid()
+            tile.fill.fore_color.rgb = WHITE
+            tile.fill.transparency = 0.18
+            tile.line.color.rgb = WHITE
+            tile.line.transparency = 0.46
+            tile.line.width = Pt(0.8)
+            _add_textbox(slide, left + Inches(0.2), top + Inches(0.12), Inches(2.4), Inches(0.5), _ui_trim(stat.get("value") or "—", 18), 26, CARD_TITLE, bold=True)
+            _add_textbox(slide, left + Inches(0.2), top + Inches(0.72), Inches(2.4), Inches(0.6), _ui_trim(stat.get("label") or "", 90), 10, CARD_BODY)
+
+    body_bullets = _dedupe_and_shorten(bullets, max_len=110, max_items=3)
+    list_top = grid_top + (Inches(4.05) if has_any_stat else Inches(0.95))
+    for idx, item in enumerate(body_bullets):
+        y = list_top + idx * Inches(0.6)
+        dot = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.OVAL, grid_left + Inches(0.45), y + Inches(0.17), Inches(0.14), Inches(0.14))
+        dot.fill.solid()
+        dot.fill.fore_color.rgb = ACCENT if idx % 2 == 0 else ACCENT_ALT
+        dot.line.fill.background()
+        _add_textbox(slide, grid_left + Inches(0.75), y, grid_w - Inches(1.1), Inches(0.5), _ui_trim(item, 140), 11, CARD_BODY)
+
+
+def _draw_stat_highlight_right(slide, right_left, slide_data: dict, bullets: list[str]) -> None:
+    stats = _extract_stats(slide_data)
+    headline_stat = stats[0] if stats else {"value": "", "label": ""}
+    panel_left = right_left + Inches(0.25)
+    panel_top = Inches(1.05)
+    panel_w = Inches(6.0)
+    panel_h = Inches(5.65)
+
+    hero = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, panel_left, panel_top, panel_w, panel_h)
+    hero.fill.solid()
+    hero.fill.fore_color.rgb = CARD_BG
+    hero.fill.transparency = 0.16
+    hero.line.color.rgb = WHITE
+    hero.line.transparency = 0.32
+    hero.line.width = Pt(1.0)
+
+    value = headline_stat.get("value") or (bullets[0] if bullets else "—")
+    label = headline_stat.get("label") or (bullets[1] if len(bullets) > 1 else "Главный показатель слайда")
+
+    _add_textbox(slide, panel_left + Inches(0.5), panel_top + Inches(0.4), panel_w - Inches(1.0), Inches(0.35), "MAIN NUMBER", 11, ACCENT_ALT, bold=True)
+    _add_textbox(slide, panel_left + Inches(0.5), panel_top + Inches(0.85), panel_w - Inches(1.0), Inches(2.2), _ui_trim(value, 18), 72, CARD_TITLE, bold=True)
+    _add_textbox(slide, panel_left + Inches(0.5), panel_top + Inches(3.15), panel_w - Inches(1.0), Inches(0.95), _ui_trim(label, 160), 16, CARD_BODY)
+
+    support = _dedupe_and_shorten(bullets[1:] if headline_stat.get("value") else bullets[2:], max_len=110, max_items=2)
+    for idx, item in enumerate(support):
+        y = panel_top + Inches(4.45 + idx * 0.8)
+        accent = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, panel_left + Inches(0.5), y + Inches(0.12), Inches(0.22), Inches(0.06))
+        accent.fill.solid()
+        accent.fill.fore_color.rgb = ACCENT if idx == 0 else ACCENT_ALT
+        accent.line.fill.background()
+        _add_textbox(slide, panel_left + Inches(0.85), y, panel_w - Inches(1.4), Inches(0.66), _ui_trim(item, 140), 11, CARD_BODY)
+
+
+def _draw_quote_highlight_right(slide, right_left, slide_data: dict, bullets: list[str]) -> None:
+    quotes = _extract_quotes(slide_data)
+    quote = quotes[0] if quotes else {"text": bullets[0] if bullets else "", "author": "Источник"}
+    panel_left = right_left + Inches(0.3)
+    panel_top = Inches(1.2)
+    panel_w = Inches(5.9)
+    panel_h = Inches(5.4)
+
+    card = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, panel_left, panel_top, panel_w, panel_h)
+    card.fill.solid()
+    card.fill.fore_color.rgb = CARD_BG
+    card.fill.transparency = 0.2
+    card.line.color.rgb = WHITE
+    card.line.transparency = 0.34
+    card.line.width = Pt(1.0)
+
+    _add_textbox(slide, panel_left + Inches(0.45), panel_top + Inches(0.35), Inches(1.4), Inches(0.6), "“", 72, ACCENT, bold=True)
+
+    quote_text = _ui_trim(quote.get("text") or "Нет точной цитаты в источнике.", 260)
+    _add_textbox(slide, panel_left + Inches(0.5), panel_top + Inches(1.1), panel_w - Inches(1.0), Inches(2.8), quote_text, 20, CARD_TITLE, bold=True)
+
+    author = _ui_trim(quote.get("author") or "Источник", 90)
+    _add_hairline_rule(slide, panel_left + Inches(0.5), panel_top + Inches(4.3), panel_left + Inches(2.5), panel_top + Inches(4.3), color=ACCENT, transparency=0.0, width=1.2)
+    _add_textbox(slide, panel_left + Inches(0.5), panel_top + Inches(4.4), panel_w - Inches(1.0), Inches(0.4), author, 12, CARD_BODY, bold=True)
+
+    support = _dedupe_and_shorten([b for b in bullets if b and b != quote.get("text")], max_len=140, max_items=2)
+    for idx, item in enumerate(support):
+        y = panel_top + Inches(4.95 + idx * 0.55)
+        _add_textbox(slide, panel_left + Inches(0.5), y, panel_w - Inches(1.0), Inches(0.5), f"· {_ui_trim(item, 130)}", 10, CARD_BODY)
+
+
+def _draw_comparison_right(slide, right_left, bullets: list[str]) -> None:
+    items = _dedupe_and_shorten(bullets, max_len=140, max_items=2) + ["Позиция A", "Позиция B"]
+    left_a = right_left + Inches(0.25)
+    col_top = Inches(1.1)
+    col_w = Inches(2.85)
+    col_h = Inches(5.55)
+    left_b = right_left + Inches(3.25)
+
+    for idx, (left, heading) in enumerate([(left_a, "A"), (left_b, "B")]):
+        panel = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, left, col_top, col_w, col_h)
+        panel.fill.solid()
+        panel.fill.fore_color.rgb = CARD_BG
+        panel.fill.transparency = 0.2
+        panel.line.color.rgb = WHITE
+        panel.line.transparency = 0.34
+        panel.line.width = Pt(1.0)
+        badge = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.OVAL, left + Inches(0.3), col_top + Inches(0.3), Inches(0.6), Inches(0.6))
+        badge.fill.solid()
+        badge.fill.fore_color.rgb = ACCENT if idx == 0 else ACCENT_ALT
+        badge.line.fill.background()
+        _add_textbox(slide, left + Inches(0.3), col_top + Inches(0.4), Inches(0.6), Inches(0.4), heading, 18, WHITE, bold=True, align=PP_ALIGN.CENTER)
+        head_text, body_text = _split_label(items[idx])
+        _add_textbox(slide, left + Inches(1.05), col_top + Inches(0.4), col_w - Inches(1.3), Inches(0.5), _ui_trim(head_text, 80), 14, CARD_TITLE, bold=True)
+        _add_textbox(slide, left + Inches(0.3), col_top + Inches(1.35), col_w - Inches(0.6), Inches(3.8), _ui_trim(body_text or head_text, 260), 11, CARD_BODY)
+
+
+def _draw_takeaways_right(slide, right_left, bullets: list[str]) -> None:
+    items = (_dedupe_and_shorten(bullets, max_len=140, max_items=5) + [
+        "Приоритет: зафиксировать ключевые выводы.",
+        "Действие: оформить дорожную карту.",
+        "Контроль: назначить ответственных и KPI.",
+    ])[:5]
+    panel_left = right_left + Inches(0.25)
+    panel_top = Inches(1.05)
+    panel_w = Inches(6.0)
+    panel_h = Inches(5.6)
+
+    panel = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, panel_left, panel_top, panel_w, panel_h)
+    panel.fill.solid()
+    panel.fill.fore_color.rgb = CARD_BG
+    panel.fill.transparency = 0.2
+    panel.line.color.rgb = WHITE
+    panel.line.transparency = 0.34
+    panel.line.width = Pt(1.0)
+
+    _add_textbox(slide, panel_left + Inches(0.4), panel_top + Inches(0.35), panel_w - Inches(0.8), Inches(0.35), "TAKEAWAYS", 11, ACCENT_ALT, bold=True)
+    _add_hairline_rule(slide, panel_left + Inches(0.4), panel_top + Inches(0.78), panel_left + panel_w - Inches(0.4), panel_top + Inches(0.78), color=WHITE, transparency=0.4)
+
+    row_h = Inches(0.9)
+    start_y = panel_top + Inches(1.0)
+    for idx, item in enumerate(items):
+        y = start_y + idx * row_h
+        number_box = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, panel_left + Inches(0.4), y, Inches(0.58), Inches(0.58))
+        number_box.fill.solid()
+        number_box.fill.fore_color.rgb = ACCENT if idx % 2 == 0 else ACCENT_ALT
+        number_box.line.fill.background()
+        _add_textbox(slide, panel_left + Inches(0.4), y + Inches(0.12), Inches(0.58), Inches(0.4), f"{idx + 1:02d}", 14, WHITE, bold=True, align=PP_ALIGN.CENTER)
+        heading, body = _split_label(item)
+        _add_textbox(slide, panel_left + Inches(1.15), y, panel_w - Inches(1.5), Inches(0.36), _ui_trim(heading, 80), 13, CARD_TITLE, bold=True)
+        if body and body.lower() != heading.lower():
+            _add_textbox(slide, panel_left + Inches(1.15), y + Inches(0.36), panel_w - Inches(1.5), Inches(0.5), _ui_trim(body, 130), 10, CARD_BODY)
+
+
 def _render_hybrid_overlay_slide(slide, slide_data: dict, slide_number: int, image_path: str | None) -> None:
     title = _extract_title(slide_data, slide_number)
     bullets = _extract_bullets(slide_data)
@@ -801,7 +1251,23 @@ def _render_hybrid_overlay_slide(slide, slide_data: dict, slide_number: int, ima
     _render_left_text_overlay(slide, title, bullets, panel_width, layout)
 
     right_left = panel_width + Inches(0.32)
-    if layout == "data_matrix":
+    if layout == "cover":
+        _draw_cover_right(slide, right_left, slide_data, title)
+    elif layout == "agenda":
+        _draw_agenda_right(slide, right_left, bullets)
+    elif layout == "context":
+        _draw_context_right(slide, right_left, slide_data, bullets)
+    elif layout == "key_findings":
+        _draw_key_findings_right(slide, right_left, slide_data, bullets)
+    elif layout == "stat_highlight":
+        _draw_stat_highlight_right(slide, right_left, slide_data, bullets)
+    elif layout == "quote_highlight":
+        _draw_quote_highlight_right(slide, right_left, slide_data, bullets)
+    elif layout == "comparison":
+        _draw_comparison_right(slide, right_left, bullets)
+    elif layout == "takeaways":
+        _draw_takeaways_right(slide, right_left, bullets)
+    elif layout == "data_matrix":
         _draw_data_matrix_right(slide, right_left, bullets)
     elif layout == "timeline":
         _draw_timeline_right(slide, right_left, bullets)
@@ -813,6 +1279,11 @@ def _render_hybrid_overlay_slide(slide, slide_data: dict, slide_number: int, ima
 
 def _render_slide(slide, slide_data: dict, slide_number: int, image_path: str | None) -> None:
     _render_hybrid_overlay_slide(slide, slide_data, slide_number, image_path)
+    title = _extract_title(slide_data, slide_number)
+    bullets = _extract_bullets(slide_data)
+    layout = _layout_type(slide_data, slide_number)
+    notes_text = _compose_notes_text(slide_data, title, layout, bullets)
+    _attach_speaker_notes(slide, notes_text)
 
 
 def _add_fallback_slide(prs: Presentation, slide_number: int, title: str = "Ошибка генерации") -> None:
