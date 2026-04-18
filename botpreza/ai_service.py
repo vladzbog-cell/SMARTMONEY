@@ -269,18 +269,19 @@ def _extract_response_text(response) -> str:
     return ""
 
 
-def _run_model(prepared_text: str, style: str = "auto") -> str:
+def _run_model(prepared_text: str, style: str = "auto", slide_count_hint: str | None = None) -> str:
     client = get_artemox_client()
     if client is None:
         return ""
 
     style_block = STYLE_INSTRUCTIONS.get(style, STYLE_INSTRUCTIONS["auto"])
     reference_brief = get_reference_style_brief()
+    hint_block = f"\nДополнительное требование от пользователя: {slide_count_hint}\n" if slide_count_hint else ""
 
     prompt = (
         f"{SYSTEM_PROMPT}\n\n"
         f"{style_block}\n\n"
-        f"Визуальный ориентир по референсным презентациям:\n{reference_brief}\n\n"
+        f"Визуальный ориентир по референсным презентациям:\n{reference_brief}\n{hint_block}\n"
         f"Исходный материал для анализа:\n{prepared_text}"
     )
     response = client.models.generate_content(
@@ -306,13 +307,14 @@ def _run_extraction(prepared_text: str) -> str:
     return _call_gemini(prompt, EXTRACTION_MODEL)
 
 
-def _run_composition(evidence_json: str, style: str) -> str:
+def _run_composition(evidence_json: str, style: str, slide_count_hint: str | None = None) -> str:
     style_block = STYLE_INSTRUCTIONS.get(style, STYLE_INSTRUCTIONS["auto"])
     reference_brief = get_reference_style_brief()
+    hint_block = f"\nДополнительное требование пользователя: {slide_count_hint}\n" if slide_count_hint else ""
     prompt = (
         f"{COMPOSITION_PROMPT}\n\n"
         f"{style_block}\n\n"
-        f"Визуальный ориентир по референсным презентациям:\n{reference_brief}\n\n"
+        f"Визуальный ориентир по референсным презентациям:\n{reference_brief}\n{hint_block}\n"
         f"Evidence brief (обязательное основание, JSON):\n{evidence_json}"
     )
     return _call_gemini(prompt, BRAIN_MODEL)
@@ -953,9 +955,9 @@ def _looks_like_auth_block(exc: Exception) -> bool:
     return any(marker in message for marker in markers)
 
 
-async def _run_model_with_timeout(prepared_text: str, style: str) -> str:
+async def _run_model_with_timeout(prepared_text: str, style: str, slide_count_hint: str | None = None) -> str:
     return await asyncio.wait_for(
-        asyncio.to_thread(_run_model, prepared_text, style),
+        asyncio.to_thread(_run_model, prepared_text, style, slide_count_hint),
         timeout=MODEL_TIMEOUT_SEC,
     )
 
@@ -983,7 +985,7 @@ def _evidence_brief_is_valid(evidence_json: str) -> bool:
     return has_text or has_arrays
 
 
-async def _run_two_stage_pipeline(text_content: str, style: str) -> str:
+async def _run_two_stage_pipeline(text_content: str, style: str, slide_count_hint: str | None = None) -> str:
     prepared_text = _prepare_text_for_model(text_content, MAX_INPUT_CHARS)
     print(
         f"Two-stage pipeline: input len={len(text_content)}, prepared={len(prepared_text)}, "
@@ -997,7 +999,7 @@ async def _run_two_stage_pipeline(text_content: str, style: str) -> str:
         return ""
     print(f"Evidence brief length: {len(evidence_raw)}")
 
-    slides_raw = await _run_with_timeout(_run_composition, evidence_raw, style)
+    slides_raw = await _run_with_timeout(_run_composition, evidence_raw, style, slide_count_hint)
     slides_raw = _clean_model_response(slides_raw)
     if not slides_raw:
         print("Composition stage produced empty output.")
@@ -1021,7 +1023,7 @@ async def _run_two_stage_pipeline(text_content: str, style: str) -> str:
     return normalized
 
 
-async def analyze_and_create_structure(text_content: str, style: str = "auto") -> str:
+async def analyze_and_create_structure(text_content: str, style: str = "auto", slide_count_hint: str | None = None) -> str:
     if get_artemox_client() is None or not (text_content or "").strip():
         return _fallback_structure(text_content, style)
 
@@ -1030,7 +1032,7 @@ async def analyze_and_create_structure(text_content: str, style: str = "auto") -
 
     if TWO_STAGE_PIPELINE and not ULTRA_CHEAP_MODE:
         try:
-            two_stage_result = await _run_two_stage_pipeline(text_content, style)
+            two_stage_result = await _run_two_stage_pipeline(text_content, style, slide_count_hint)
             if two_stage_result:
                 return two_stage_result
         except asyncio.TimeoutError:
@@ -1043,7 +1045,7 @@ async def analyze_and_create_structure(text_content: str, style: str = "auto") -
                 return _fallback_structure(text_content, style)
 
     try:
-        result = await _run_model_with_timeout(prepared_text, style)
+        result = await _run_model_with_timeout(prepared_text, style, slide_count_hint)
         if result:
             normalized = _normalize_model_structure(result, style)
             if normalized:
@@ -1061,7 +1063,7 @@ async def analyze_and_create_structure(text_content: str, style: str = "auto") -
     retry_text = _prepare_text_for_model(text_content, RETRY_INPUT_CHARS)
     print(f"Artemox retry with reduced input length={len(retry_text)}")
     try:
-        result = await _run_model_with_timeout(retry_text, style)
+        result = await _run_model_with_timeout(retry_text, style, slide_count_hint)
         if result:
             normalized = _normalize_model_structure(result, style)
             if normalized:

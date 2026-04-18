@@ -35,6 +35,11 @@ router = Router()
 ARTEMOX_RETRY_ATTEMPTS = 3
 ARTEMOX_RETRY_DELAY_SEC = 20
 
+# Last-generation cache keyed by chat_id so users can iterate on the deck
+# without re-uploading the source material. Evicted automatically on new
+# material ingestion (each new /start or upload overwrites the entry).
+LAST_GENERATION: dict[int, dict] = {}
+
 MAIN_MENU_TEXTS = {
     "🪄 Создать презентацию",
     "💼 Мой профиль / Лимиты",
@@ -53,6 +58,19 @@ def _style_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🚀 Питч стартапа", callback_data="style:pitch")],
         [InlineKeyboardButton(text="🎨 Креативный", callback_data="style:creative")],
         [InlineKeyboardButton(text="🤖 На усмотрение ИИ", callback_data="style:auto")],
+    ])
+
+
+def _post_delivery_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🔁 Перегенерировать", callback_data="regen:same"),
+            InlineKeyboardButton(text="➕ Больше слайдов", callback_data="regen:more"),
+        ],
+        [
+            InlineKeyboardButton(text="🎯 Сделать короче", callback_data="regen:shorter"),
+            InlineKeyboardButton(text="🎨 Другой стиль", callback_data="regen:restyle"),
+        ],
     ])
 
 
@@ -286,39 +304,25 @@ async def process_user_material(message: Message, state: FSMContext):
                 logging.exception("Failed to remove temporary input file")
 
 
-# ── Style callback: triggers generation after user picks a style ─────────
+STYLE_LABELS = {
+    "academic": "🏛 Академический",
+    "pitch": "🚀 Питч стартапа",
+    "creative": "🎨 Креативный",
+    "auto": "🤖 На усмотрение ИИ",
+}
 
-@router.callback_query(GenState.waiting_for_style, F.data.startswith("style:"))
-async def on_style_chosen(callback: CallbackQuery, state: FSMContext):
-    style = callback.data.split(":", 1)[1]  # academic / pitch / creative / auto
-    data = await state.get_data()
-    extracted_text = data.get("extracted_text", "")
-    status_msg_id = data.get("status_msg_id")
-    source_kind = data.get("source_kind", "text")
-    source_label = data.get("source_label", "")
-    await state.clear()
-    await callback.answer()
 
-    chat_id = callback.message.chat.id
-    bot = callback.bot
-
-    STYLE_LABELS = {
-        "academic": "🏛 Академический",
-        "pitch": "🚀 Питч стартапа",
-        "creative": "🎨 Креативный",
-        "auto": "🤖 На усмотрение ИИ",
-    }
-    style_label = STYLE_LABELS.get(style, style)
-
-    try:
-        await bot.edit_message_text(
-            f"📥 Сканирую материал и применяю стиль «{style_label}»...",
-            chat_id=chat_id, message_id=status_msg_id,
-        )
-    except Exception:
-        status_msg = await bot.send_message(chat_id, f"📥 Сканирую материал и применяю стиль «{style_label}»...")
-        status_msg_id = status_msg.message_id
-
+async def _run_full_generation(
+    bot: Bot,
+    chat_id: int,
+    status_msg_id: int,
+    extracted_text: str,
+    style: str,
+    source_kind: str,
+    source_label: str,
+    *,
+    slide_count_hint: str | None = None,
+) -> None:
     temp_pptx_path = None
     try:
         await bot.edit_message_text(
@@ -330,7 +334,7 @@ async def on_style_chosen(callback: CallbackQuery, state: FSMContext):
         last_retry_error = ""
         for attempt in range(1, ARTEMOX_RETRY_ATTEMPTS + 1):
             try:
-                result = await analyze_and_create_structure(extracted_text, style)
+                result = await analyze_and_create_structure(extracted_text, style, slide_count_hint=slide_count_hint)
                 if result == ARTEMOX_QUOTA_EXCEEDED_SENTINEL:
                     raise RuntimeError("429 quota")
                 if result:
@@ -421,6 +425,21 @@ async def on_style_chosen(callback: CallbackQuery, state: FSMContext):
             chat_id=chat_id, message_id=status_msg_id,
         )
 
+        LAST_GENERATION[chat_id] = {
+            "extracted_text": extracted_text,
+            "style": style,
+            "source_kind": source_kind,
+            "source_label": source_label,
+        }
+        try:
+            await bot.send_message(
+                chat_id,
+                "Хотите скорректировать результат?",
+                reply_markup=_post_delivery_keyboard(),
+            )
+        except Exception:
+            logging.exception("Failed to send post-delivery keyboard")
+
         if AUDIO_ENABLED:
             audio_path = None
             try:
@@ -454,8 +473,8 @@ async def on_style_chosen(callback: CallbackQuery, state: FSMContext):
                     except OSError:
                         pass
     except Exception as e:
-        print(f"КРИТИЧЕСКАЯ ОШИБКА (on_style_chosen): {e}")
-        logging.exception("Failed during generation after style choice")
+        print(f"КРИТИЧЕСКАЯ ОШИБКА (generation): {e}")
+        logging.exception("Failed during generation")
         try:
             await bot.edit_message_text(
                 "❌ Произошла системная ошибка. Разработчик уже смотрит логи.",
@@ -469,3 +488,91 @@ async def on_style_chosen(callback: CallbackQuery, state: FSMContext):
                 os.remove(temp_pptx_path)
             except OSError:
                 pass
+
+
+# ── Style callback: triggers generation after user picks a style ─────────
+
+@router.callback_query(GenState.waiting_for_style, F.data.startswith("style:"))
+async def on_style_chosen(callback: CallbackQuery, state: FSMContext):
+    style = callback.data.split(":", 1)[1]
+    data = await state.get_data()
+    extracted_text = data.get("extracted_text", "")
+    status_msg_id = data.get("status_msg_id")
+    source_kind = data.get("source_kind", "text")
+    source_label = data.get("source_label", "")
+    await state.clear()
+    await callback.answer()
+
+    chat_id = callback.message.chat.id
+    bot = callback.bot
+    style_label = STYLE_LABELS.get(style, style)
+
+    try:
+        await bot.edit_message_text(
+            f"📥 Сканирую материал и применяю стиль «{style_label}»...",
+            chat_id=chat_id, message_id=status_msg_id,
+        )
+    except Exception:
+        status_msg = await bot.send_message(chat_id, f"📥 Сканирую материал и применяю стиль «{style_label}»...")
+        status_msg_id = status_msg.message_id
+
+    await _run_full_generation(
+        bot, chat_id, status_msg_id, extracted_text, style, source_kind, source_label,
+    )
+
+
+# ── Regen callbacks: iterate on last delivered deck ─────────────────────
+
+REGEN_LABELS = {
+    "same": ("🔁", "перегенерирую"),
+    "more": ("➕", "увеличиваю объём"),
+    "shorter": ("🎯", "делаю компактнее"),
+    "restyle": ("🎨", "меняю стиль"),
+}
+
+
+@router.callback_query(F.data.startswith("regen:"))
+async def on_regen_action(callback: CallbackQuery, state: FSMContext):
+    action = callback.data.split(":", 1)[1]
+    chat_id = callback.message.chat.id
+    bot = callback.bot
+    await callback.answer()
+
+    cache = LAST_GENERATION.get(chat_id)
+    if not cache or not cache.get("extracted_text"):
+        await bot.send_message(
+            chat_id,
+            "⚠️ Нет исходника для перегенерации. Отправьте материал заново.",
+        )
+        return
+
+    if action == "restyle":
+        await state.update_data(
+            extracted_text=cache["extracted_text"],
+            status_msg_id=(await bot.send_message(chat_id, "🎨 Выберите новый стиль:")).message_id,
+            source_kind=cache.get("source_kind", "text"),
+            source_label=cache.get("source_label", ""),
+        )
+        await state.set_state(GenState.waiting_for_style)
+        await bot.send_message(chat_id, "Какой стиль использовать?", reply_markup=_style_keyboard())
+        return
+
+    emoji, verb = REGEN_LABELS.get(action, ("🔁", "перегенерирую"))
+    status_msg = await bot.send_message(chat_id, f"{emoji} {verb.capitalize()} презентацию...")
+
+    slide_count_hint = None
+    if action == "more":
+        slide_count_hint = "Сделай более подробную версию: больше слайдов (ближе к 10), раскрой детали и нюансы."
+    elif action == "shorter":
+        slide_count_hint = "Сделай компактную версию: меньше слайдов (6-7), только самое главное, без повторов."
+
+    await _run_full_generation(
+        bot,
+        chat_id,
+        status_msg.message_id,
+        cache["extracted_text"],
+        cache.get("style", "auto"),
+        cache.get("source_kind", "text"),
+        cache.get("source_label", ""),
+        slide_count_hint=slide_count_hint,
+    )
