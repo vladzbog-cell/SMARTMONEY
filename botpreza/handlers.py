@@ -52,13 +52,32 @@ class GenState(StatesGroup):
     waiting_for_style = State()
 
 
-def _style_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🏛 Академический / Отчёт", callback_data="style:academic")],
-        [InlineKeyboardButton(text="🚀 Питч стартапа", callback_data="style:pitch")],
-        [InlineKeyboardButton(text="🎨 Креативный", callback_data="style:creative")],
-        [InlineKeyboardButton(text="🤖 На усмотрение ИИ", callback_data="style:auto")],
-    ])
+def _style_keyboard(last_style: str | None = None) -> InlineKeyboardMarkup:
+    """Style picker. If the user picked a style before, prefix that row with ✓."""
+    rows = [
+        ("academic", "🏛 Академический / Отчёт"),
+        ("pitch", "🚀 Питч стартапа"),
+        ("creative", "🎨 Креативный"),
+        ("auto", "🤖 На усмотрение ИИ"),
+    ]
+    keyboard = []
+    for key, label in rows:
+        prefix = "✓ " if last_style == key else ""
+        keyboard.append([InlineKeyboardButton(text=f"{prefix}{label}", callback_data=f"style:{key}")])
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+def _thin_input_warning(text: str) -> str | None:
+    cleaned = re.sub(r"\s+", " ", (text or "").strip())
+    if not cleaned:
+        return "⚠️ Источник пустой — добавьте больше деталей или пришлите документ."
+    if len(cleaned) < 280:
+        return (
+            "ℹ️ Материал получился коротким. "
+            "Бот всё равно соберёт презентацию, но результат будет плотнее, "
+            "если добавить контекст: цель, аудитория, факты и цифры."
+        )
+    return None
 
 
 def _post_delivery_keyboard() -> InlineKeyboardMarkup:
@@ -184,9 +203,14 @@ async def process_document(message: Message, bot: Bot, state: FSMContext):
         )
         await state.set_state(GenState.waiting_for_style)
 
+        warning = _thin_input_warning(text_content)
+        if warning:
+            await message.answer(warning)
+
+        last_style = (LAST_GENERATION.get(message.chat.id) or {}).get("style")
         await status_msg.edit_text(
             "📄 Текст извлечён! Какой стиль оформления использовать?",
-            reply_markup=_style_keyboard(),
+            reply_markup=_style_keyboard(last_style),
         )
 
     except Exception as e:
@@ -287,9 +311,14 @@ async def process_user_material(message: Message, state: FSMContext):
         )
         await state.set_state(GenState.waiting_for_style)
 
+        warning = _thin_input_warning(extracted_text)
+        if warning:
+            await message.answer(warning)
+
+        last_style = (LAST_GENERATION.get(message.chat.id) or {}).get("style")
         await status_message.edit_text(
             "📄 Материал обработан! Какой стиль оформления использовать?",
-            reply_markup=_style_keyboard(),
+            reply_markup=_style_keyboard(last_style),
         )
 
     except Exception as e:
@@ -554,7 +583,11 @@ async def on_regen_action(callback: CallbackQuery, state: FSMContext):
             source_label=cache.get("source_label", ""),
         )
         await state.set_state(GenState.waiting_for_style)
-        await bot.send_message(chat_id, "Какой стиль использовать?", reply_markup=_style_keyboard())
+        await bot.send_message(
+            chat_id,
+            "Какой стиль использовать?",
+            reply_markup=_style_keyboard(cache.get("style")),
+        )
         return
 
     emoji, verb = REGEN_LABELS.get(action, ("🔁", "перегенерирую"))
