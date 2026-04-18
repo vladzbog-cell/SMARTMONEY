@@ -4,6 +4,12 @@ import json
 import os
 import re
 
+try:
+    from PIL import Image, ImageStat  # type: ignore
+    _PIL_AVAILABLE = True
+except Exception:  # pragma: no cover
+    _PIL_AVAILABLE = False
+
 from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE, MSO_CONNECTOR
@@ -1381,6 +1387,36 @@ def _render_slide(slide, slide_data: dict, slide_number: int, image_path: str | 
     _attach_speaker_notes(slide, notes_text)
 
 
+def _image_is_acceptable(path: str) -> bool:
+    """Reject generated images that would hurt the slide.
+
+    Drops files that are too small, too uniform (monotone blobs),
+    or overly dark/washed-out where overlay text becomes illegible.
+    """
+    try:
+        if not path or not os.path.exists(path):
+            return False
+        if os.path.getsize(path) < 10_000:
+            return False
+        if not _PIL_AVAILABLE:
+            return True  # no Pillow → trust the source
+        with Image.open(path) as img:
+            if img.width < 800 or img.height < 450:
+                return False
+            sample = img.convert("RGB").resize((120, 68))
+            stat = ImageStat.Stat(sample)
+            mean = sum(stat.mean) / 3.0
+            stddev = sum(stat.stddev) / 3.0
+            if stddev < 8.0:  # flat/monotone
+                return False
+            if mean < 18 or mean > 244:  # pure black/white
+                return False
+        return True
+    except Exception as exc:
+        print(f"image quality check failed: {exc}")
+        return False
+
+
 SOURCE_KIND_LABELS = {
     "pdf": "PDF",
     "docx": "DOCX",
@@ -1479,7 +1515,11 @@ async def build_pptx_from_json(json_string: str, output_filename: str, meta: dic
 
             if image_path and os.path.exists(image_path):
                 generated_image_paths.append(image_path)
-                image_success_count += 1
+                if _image_is_acceptable(image_path):
+                    image_success_count += 1
+                else:
+                    print(f"⚠️ Slide {slide_number}: image failed quality filter, falling back to gradient")
+                    image_path = None
             else:
                 image_path = None
 
