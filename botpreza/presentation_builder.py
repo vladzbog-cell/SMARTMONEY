@@ -768,7 +768,7 @@ def _add_glass_panel(slide, *, width_ratio: float = 0.36, transparency: float = 
     return panel_width
 
 
-def _ui_trim(text: str, limit: int) -> str:
+def _ui_trim(text: str, limit: int, *, ellipsis: bool = True) -> str:
     normalized = re.sub(r"\s+", " ", (text or "").strip()).strip(" .;:-")
     if len(normalized) <= limit:
         return normalized
@@ -776,7 +776,10 @@ def _ui_trim(text: str, limit: int) -> str:
     pivot = max(cut.rfind("."), cut.rfind(":"), cut.rfind(","), cut.rfind(" "))
     if pivot > int(limit * 0.55):
         cut = cut[:pivot]
-    return cut.strip(" .;:-")
+    cut = cut.strip(" .;:-")
+    if ellipsis and cut and not cut.endswith(("…", "...", ".")):
+        cut = f"{cut}…"
+    return cut
 
 
 def _overlay_bullets_for_left(layout: str, bullets: list[str]) -> list[str]:
@@ -802,7 +805,7 @@ def _render_left_text_overlay(slide, title: str, bullets: list[str], panel_width
     content_left = Inches(0.62)
     content_width = panel_width - Inches(1.0)
 
-    title_text = _ui_trim(title, 88)
+    title_text = _ui_trim(title, 88, ellipsis=False)
     title_size = 32 if len(title_text) > 58 else 36
 
     _add_textbox(
@@ -861,7 +864,7 @@ def _draw_split_infographic_right(slide, right_left, bullets: list[str]) -> None
         accent.fill.fore_color.rgb = ACCENT if idx % 2 == 0 else ACCENT_ALT
         accent.line.fill.background()
         heading, body = _split_label(text)
-        _add_textbox(slide, left + Inches(0.2), top + Inches(0.3), card_w - Inches(0.35), Inches(0.38), _ui_trim(heading, 48), 13, CARD_TITLE, bold=True)
+        _add_textbox(slide, left + Inches(0.2), top + Inches(0.3), card_w - Inches(0.35), Inches(0.38), _ui_trim(heading, 48, ellipsis=False), 13, CARD_TITLE, bold=True)
         _add_textbox(slide, left + Inches(0.2), top + Inches(0.68), card_w - Inches(0.35), Inches(0.62), _ui_trim(body or heading, 72), 10, CARD_BODY)
 
 
@@ -894,7 +897,7 @@ def _draw_timeline_right(slide, right_left, bullets: list[str]) -> None:
         card.line.color.rgb = WHITE
         card.line.transparency = 0.34
         card.line.width = Pt(0.8)
-        _add_textbox(slide, right_left + Inches(1.33), y - Inches(0.16), Inches(3.95), Inches(0.34), f"{idx + 1}. {_ui_trim(heading, 52)}", 12, CARD_TITLE, bold=True)
+        _add_textbox(slide, right_left + Inches(1.33), y - Inches(0.16), Inches(3.95), Inches(0.34), f"{idx + 1}. {_ui_trim(heading, 52, ellipsis=False)}", 12, CARD_TITLE, bold=True)
         _add_textbox(slide, right_left + Inches(1.33), y + Inches(0.16), Inches(3.95), Inches(0.3), _ui_trim(body or heading, 64), 9, CARD_BODY)
 
 
@@ -1015,7 +1018,7 @@ def _draw_cover_right(slide, right_left, slide_data: dict, title: str) -> None:
         mark_top + Inches(0.95),
         mark_w - Inches(0.9),
         Inches(2.0),
-        _ui_trim(title, 90),
+        _ui_trim(title, 90, ellipsis=False),
         TS_DISPLAY,
         WHITE,
         bold=True,
@@ -1079,7 +1082,7 @@ def _draw_agenda_right(slide, right_left, bullets: list[str]) -> None:
         number_box.line.fill.background()
         _add_textbox(slide, card_left + Inches(0.4), y + Inches(0.09), Inches(0.56), Inches(0.4), f"{idx + 1:02d}", 14, WHITE, bold=True, align=PP_ALIGN.CENTER)
         heading, body = _split_label(item)
-        _add_textbox(slide, card_left + Inches(1.15), y + Inches(0.02), card_w - Inches(1.55), Inches(0.34), _ui_trim(heading, 72), 14, CARD_TITLE, bold=True)
+        _add_textbox(slide, card_left + Inches(1.15), y + Inches(0.02), card_w - Inches(1.55), Inches(0.34), _ui_trim(heading, 72, ellipsis=False), 14, CARD_TITLE, bold=True)
         if body and body.lower() != heading.lower():
             _add_textbox(slide, card_left + Inches(1.15), y + Inches(0.38), card_w - Inches(1.55), Inches(0.44), _ui_trim(body, 100), 10, CARD_BODY)
 
@@ -1156,7 +1159,7 @@ def _draw_key_findings_right(slide, right_left, slide_data: dict, bullets: list[
             tile.line.color.rgb = WHITE
             tile.line.transparency = 0.46
             tile.line.width = Pt(0.8)
-            _add_textbox(slide, left + Inches(0.2), top + Inches(0.12), Inches(2.4), Inches(0.5), _ui_trim(stat.get("value") or "—", 18), 26, CARD_TITLE, bold=True)
+            _add_textbox(slide, left + Inches(0.2), top + Inches(0.12), Inches(2.4), Inches(0.5), _ui_trim(stat.get("value") or "—", 18, ellipsis=False), 26, CARD_TITLE, bold=True)
             _add_textbox(slide, left + Inches(0.2), top + Inches(0.72), Inches(2.4), Inches(0.6), _ui_trim(stat.get("label") or "", 90), 10, CARD_BODY)
 
     body_bullets = _dedupe_and_shorten(bullets, max_len=110, max_items=3)
@@ -1196,7 +1199,7 @@ def _draw_stat_highlight_right(slide, right_left, slide_data: dict, bullets: lis
         panel_top + Inches(0.85),
         panel_w - Inches(1.0),
         Inches(2.2),
-        _ui_trim(value, 18),
+        _ui_trim(value, 18, ellipsis=False),
         72,
         CARD_TITLE,
         bold=True,
@@ -1291,7 +1294,7 @@ def _draw_comparison_right(slide, right_left, bullets: list[str]) -> None:
         badge.line.fill.background()
         _add_textbox(slide, left + Inches(0.3), col_top + Inches(0.4), Inches(0.6), Inches(0.4), heading, 18, WHITE, bold=True, align=PP_ALIGN.CENTER)
         head_text, body_text = _split_label(items[idx])
-        _add_textbox(slide, left + Inches(1.05), col_top + Inches(0.4), col_w - Inches(1.3), Inches(0.5), _ui_trim(head_text, 80), 14, CARD_TITLE, bold=True)
+        _add_textbox(slide, left + Inches(1.05), col_top + Inches(0.4), col_w - Inches(1.3), Inches(0.5), _ui_trim(head_text, 80, ellipsis=False), 14, CARD_TITLE, bold=True)
         _add_textbox(slide, left + Inches(0.3), col_top + Inches(1.35), col_w - Inches(0.6), Inches(3.8), _ui_trim(body_text or head_text, 260), 11, CARD_BODY)
 
 
@@ -1327,7 +1330,7 @@ def _draw_takeaways_right(slide, right_left, bullets: list[str]) -> None:
         number_box.line.fill.background()
         _add_textbox(slide, panel_left + Inches(0.4), y + Inches(0.12), Inches(0.58), Inches(0.4), f"{idx + 1:02d}", 14, WHITE, bold=True, align=PP_ALIGN.CENTER)
         heading, body = _split_label(item)
-        _add_textbox(slide, panel_left + Inches(1.15), y, panel_w - Inches(1.5), Inches(0.36), _ui_trim(heading, 80), 13, CARD_TITLE, bold=True)
+        _add_textbox(slide, panel_left + Inches(1.15), y, panel_w - Inches(1.5), Inches(0.36), _ui_trim(heading, 80, ellipsis=False), 13, CARD_TITLE, bold=True)
         if body and body.lower() != heading.lower():
             _add_textbox(slide, panel_left + Inches(1.15), y + Inches(0.36), panel_w - Inches(1.5), Inches(0.5), _ui_trim(body, 130), 10, CARD_BODY)
 
