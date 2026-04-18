@@ -11,18 +11,45 @@ from artemox_client import (
 )
 from reference_style_service import get_reference_style_brief
 
-MAX_INPUT_CHARS = 45000
-RETRY_INPUT_CHARS = 15000
-MODEL_TIMEOUT_SEC = 45
-TARGET_SLIDE_COUNT = max(3, min(5, int(os.getenv("PRESENTATION_TARGET_SLIDES", "3") or "3")))
+MAX_INPUT_CHARS = 60000
+RETRY_INPUT_CHARS = 18000
+MODEL_TIMEOUT_SEC = 60
+
+def _env_int(name: str, default: int) -> int:
+    raw = (os.getenv(name) or "").strip()
+    try:
+        return int(raw) if raw else default
+    except ValueError:
+        return default
+
+SLIDE_COUNT_MIN = max(4, _env_int("PRESENTATION_MIN_SLIDES", 6))
+SLIDE_COUNT_MAX = max(SLIDE_COUNT_MIN, _env_int("PRESENTATION_MAX_SLIDES", 10))
+TARGET_SLIDE_COUNT = max(SLIDE_COUNT_MIN, min(SLIDE_COUNT_MAX, _env_int("PRESENTATION_TARGET_SLIDES", 8)))
 ULTRA_CHEAP_MODE = os.getenv("ULTRA_CHEAP_MODE", "0").strip().lower() in {"1", "true", "yes", "on"}
 DISABLE_TEXT_RETRY = os.getenv("DISABLE_TEXT_RETRY", "0").strip().lower() in {"1", "true", "yes", "on"}
 BRAIN_MODEL = os.getenv("ARTEMOX_BRAIN_MODEL", "gemini-1.5-pro").strip() or ARTEMOX_MODEL
 
 if ULTRA_CHEAP_MODE:
-    MAX_INPUT_CHARS = min(MAX_INPUT_CHARS, 12000)
-    RETRY_INPUT_CHARS = min(RETRY_INPUT_CHARS, 8000)
-    MODEL_TIMEOUT_SEC = min(MODEL_TIMEOUT_SEC, 30)
+    MAX_INPUT_CHARS = min(MAX_INPUT_CHARS, 16000)
+    RETRY_INPUT_CHARS = min(RETRY_INPUT_CHARS, 9000)
+    MODEL_TIMEOUT_SEC = min(MODEL_TIMEOUT_SEC, 40)
+    SLIDE_COUNT_MAX = min(SLIDE_COUNT_MAX, 8)
+    TARGET_SLIDE_COUNT = min(TARGET_SLIDE_COUNT, SLIDE_COUNT_MAX)
+
+ALLOWED_LAYOUTS = (
+    "cover",
+    "agenda",
+    "context",
+    "key_findings",
+    "split_infographic",
+    "timeline",
+    "data_matrix",
+    "quote_highlight",
+    "stat_highlight",
+    "comparison",
+    "takeaways",
+    "hero_concept",
+)
 
 STYLE_INSTRUCTIONS = {
     "academic": (
@@ -71,29 +98,52 @@ NOTEBOOKLM_PRODUCT_BRIEF = (
 )
 
 SYSTEM_PROMPT = (
-    "Ты — Арт-директор мирового уровня. Твоя задача — превратить текстовый материал "
-    "в серию сильных аналитических слайдов формата 16:9 для гибридной презентации.\n\n"
+    "Ты — Арт-директор и редактор-аналитик уровня NotebookLM. Твоя задача — превратить исходный материал "
+    "в связное повествование из структурированных слайдов формата 16:9 для гибридной презентации.\n\n"
     f"{NOTEBOOKLM_PRODUCT_BRIEF}\n\n"
-    "Ты НЕ создаёшь текст для PowerPoint. Ты придумываешь подробные промпты для "
-    "генератора картинок, который рисует только фоновые визуалы, а текст будет наложен отдельно в PowerPoint.\n\n"
-    f"Создай ровно {TARGET_SLIDE_COUNT} слайда. "
-    "Каждая ключевая мысль, факт, цифра или аргумент заслуживают отдельный слайд.\n\n"
-    "Верни строго валидный JSON-массив без markdown и без пояснений. Формат:\n"
-    '[{"slide_number": 1, "layout_type": "...", "visual_meta_prompt": "...", "content": {"title": "...", "bullets": ["...", "..."]}}, {"slide_number": 2, "layout_type": "...", "visual_meta_prompt": "...", "content": {"title": "...", "bullets": ["...", "..."]}}]\n\n'
+    "Ты НЕ создаёшь текст для PowerPoint вручную. Ты продумываешь структуру повествования, "
+    "подробные промпты для генератора картинок (фоновые визуалы) и выдаёшь структурированный JSON, "
+    "который программа сама соберёт в слайд.\n\n"
+    f"Собери презентацию из {SLIDE_COUNT_MIN}–{SLIDE_COUNT_MAX} слайдов (ориентир {TARGET_SLIDE_COUNT}). "
+    "Количество слайдов подбирай под объём и плотность исходного материала: "
+    f"меньше материала — ближе к {SLIDE_COUNT_MIN}, плотный и многокомпонентный — ближе к {SLIDE_COUNT_MAX}.\n\n"
+    "Повествование должно идти как в NotebookLM Audio Overview: обложка → повестка → контекст/вводная → "
+    "ключевые находки с цифрами и цитатами → сравнения/сценарии/процесс → выводы → takeaways.\n\n"
+    "Верни строго валидный JSON-массив без markdown и без пояснений. Каждый элемент массива — один слайд "
+    "со следующей схемой:\n"
+    '{\n'
+    '  "slide_number": 1,\n'
+    '  "layout_type": "cover|agenda|context|key_findings|split_infographic|timeline|data_matrix|quote_highlight|stat_highlight|comparison|takeaways|hero_concept",\n'
+    '  "visual_meta_prompt": "подробный промпт фонового изображения без текста",\n'
+    '  "content": {\n'
+    '    "title": "краткий, осмысленный заголовок",\n'
+    '    "subtitle": "опциональная лид-строка/дескриптор (до 140 симв.)",\n'
+    '    "bullets": ["2-5 содержательных буллетов"],\n'
+    '    "stats": [ {"value": "42%", "label": "что это значит"} ],\n'
+    '    "quotes": [ {"text": "короткая цитата из источника", "author": "кто сказал или источник"} ],\n'
+    '    "source_hint": "на каком фрагменте исходника основан слайд (1 предложение)"\n'
+    '  },\n'
+    '  "speaker_notes": "3-5 предложений для устного сопровождения слайда на уровне аналитика-докладчика"\n'
+    '}\n\n'
     "Правила:\n"
-    "1. Для каждого слайда верни content.title и 2-4 content.bullets для наложения поверх фона.\n"
-    "2. layout_type обязателен. Разрешённые типы: split_infographic, data_matrix, hero_concept, timeline.\n"
-    "3. visual_meta_prompt описывает только фон слайда, без текста и без слов в изображении.\n"
-    "4. Фон должен поддерживать конкретный layout_type: оставляй чистые зоны там, где будет текст, карточки, матрица или схема.\n"
-    "5. Укажи композицию, палитру, свет, материалы, атмосферу и глубину.\n"
-    "6. Запрещены: любой текст, слова, буквы на фоне, стоковые люди в офисе, рукопожатия, совещания.\n"
-    "7. Ориентируйся не на банальный pitch deck, а на аналитические editorial slides уровня strategy report: матрицы, схемы, карточки, техно-диаграммы, график+вывод, архитектурные композиции.\n"
-    f"8. На наборе из {TARGET_SLIDE_COUNT} слайдов обязательно должны присутствовать: hero_concept, минимум один timeline/split_infographic, минимум один data_matrix.\n"
-    "9. Первый слайд — hero_concept. Последний — data_matrix или split_infographic с итоговым выводом.\n"
-    "10. При выборе layout_type учитывай не только текст, но и формат материала: если есть факторы и сравнение план/факт — data_matrix; "
-    "если есть последовательность этапов — timeline; "
-    "если нужен сильный концептуальный старт — hero_concept; "
-    "в остальных случаях — split_infographic.\n"
+    "1. content.title обязателен и содержателен (не «Слайд 2»). content.bullets — 2-5 шт. для наложения на фон.\n"
+    "2. Разрешённые layout_type: cover, agenda, context, key_findings, split_infographic, timeline, data_matrix, "
+    "quote_highlight, stat_highlight, comparison, takeaways, hero_concept. Выбор типа подчиняй смыслу слайда.\n"
+    "3. Обязательная композиция: первый слайд — cover (обложка с названием и идеей), второй — agenda "
+    "(повестка на 3-6 пунктов), предпоследний или последний — takeaways (3-5 тезисов-выводов). "
+    f"Набор из {SLIDE_COUNT_MIN}+ слайдов обязан включать как минимум один слайд с цифрами (stat_highlight/data_matrix/key_findings со stats) "
+    "и хотя бы один quote_highlight/comparison, если материал это позволяет.\n"
+    "4. Поля stats и quotes заполняй только если цифры/цитаты реально есть или логично выводятся из материала. "
+    "Нельзя выдумывать несуществующие цифры — если точных данных нет, оставь stats/quotes пустыми массивами.\n"
+    "5. source_hint — короткая опора на источник (например: «На основе раздела о ключевых факторах роста»). "
+    "speaker_notes — разговорные заметки докладчика, раскрывающие слайд, без повторения буллетов дословно.\n"
+    "6. visual_meta_prompt — только визуальный фон: композиция, палитра, свет, материалы, атмосфера, глубина. "
+    "Фон должен поддерживать layout_type, оставляя чистые зоны под текст/карточки/схемы. "
+    "Запрещены: любой текст, слова, буквы на фоне, стоковые люди в офисе, рукопожатия, совещания.\n"
+    "7. Ориентир: аналитические editorial slides уровня strategy report / NotebookLM brief — матрицы, схемы, карточки, "
+    "техно-диаграммы, график+вывод, архитектурные композиции.\n"
+    "8. Между слайдами должно быть явное повествовательное развитие: контекст → находки → сравнения → выводы. "
+    "Не допускай дубликатов и пустых слайдов.\n"
 )
 
 
@@ -282,33 +332,152 @@ def _signal_bullets(units: list[str], *, limit: int = 3) -> list[str]:
     return prepared
 
 
+def _fallback_stats(units: list[str]) -> list[dict]:
+    stats: list[dict] = []
+    pattern = re.compile(r"(\d+[\d\s.,]*\s?(?:%|млрд|млн|трлн|тыс|руб|₽|\$|долл|год|мес|дней|человек|раз)?)", re.IGNORECASE)
+    seen_values: set[str] = set()
+    for unit in units:
+        match = pattern.search(unit)
+        if not match:
+            continue
+        value = re.sub(r"\s+", " ", match.group(1)).strip()
+        if not value or value in seen_values:
+            continue
+        label_raw = (unit[: match.start()] + unit[match.end():]).strip(" -—:;,.")
+        label = _smart_trim(label_raw, 88) or "Показатель из исходного материала"
+        stats.append({"value": value[:24], "label": label})
+        seen_values.add(value)
+        if len(stats) >= 3:
+            break
+    return stats
+
+
+def _fallback_quotes(units: list[str]) -> list[dict]:
+    quotes: list[dict] = []
+    for unit in units:
+        match = re.search(r"[«\"]([^«»\"]{25,200})[»\"]", unit)
+        if match:
+            quotes.append({"text": match.group(1).strip(), "author": "Источник"})
+        if len(quotes) >= 2:
+            break
+    return quotes
+
+
+def _fallback_speaker_notes(layout_type: str, title: str, bullets: list[str]) -> str:
+    lead = {
+        "cover": "Открываем презентацию: обозначаем тему, контекст и для кого материал.",
+        "agenda": "Озвучиваем повестку: по пунктам проговариваем, какие блоки рассмотрим и в каком порядке.",
+        "context": "Задаём контекст: что происходит в отрасли/ситуации и почему эта тема важна именно сейчас.",
+        "key_findings": "Перечисляем ключевые находки, подчёркиваем самые сильные цифры и то, что за ними стоит.",
+        "stat_highlight": "Акцентируем внимание на главной цифре: поясняем, как она получена и что она означает.",
+        "quote_highlight": "Оттеняем тезис цитатой: коротко комментируем, почему она важна для темы.",
+        "split_infographic": "Разбираем блок карточек: поясняем каждую, связывая с общей идеей.",
+        "timeline": "Проходим по таймлайну: показываем логику этапов и какие действия они подразумевают.",
+        "data_matrix": "Читаем матрицу: сравниваем план и реальность, подсвечиваем разрывы и выводы.",
+        "comparison": "Сравниваем две позиции и подчёркиваем, в чём принципиальная разница и что из этого следует.",
+        "takeaways": "Сводим выводы: проговариваем главные тезисы, действия и дальнейшие шаги.",
+        "hero_concept": "Формулируем ключевой концепт слайда и зачем он нужен для общей истории.",
+    }.get(layout_type, "Комментируем слайд своими словами, опираясь на буллеты и контекст.")
+    bullet_hint = "; ".join(item for item in bullets[:2]) if bullets else ""
+    tail = f" Ключевые тезисы: {bullet_hint}." if bullet_hint else ""
+    return _clean_inline_text(f"{lead}{tail} Заголовок слайда: «{title}».", 1000)
+
+
 def _fallback_slide_pack(text_content: str, style: str, target_total: int) -> list[dict]:
-    units = _clean_units(_extract_candidate_lines(text_content) + _extract_sentences(text_content), max_items=12)
+    units = _clean_units(_extract_candidate_lines(text_content) + _extract_sentences(text_content), max_items=20)
     keys = _keywords(text_content, 4)
     topic = _topic_phrase(keys)
-    signals = _signal_bullets(units, limit=3)
+    signals = _signal_bullets(units, limit=6)
+    stats_pool = _fallback_stats(units)
+    quotes_pool = _fallback_quotes(units)
 
-    specs = [
-        ("hero_concept", "Контекст и рамка анализа", _fallback_bullets("intro", keys)),
-        ("timeline", "Ключевые факторы и логика реализации", (signals[:2] + _fallback_bullets("middle", keys))[:3]),
-        ("data_matrix", "Приоритеты: План vs Реальность", _fallback_bullets("conclusion", keys)),
-        ("split_infographic", "Динамика и контроль исполнения", (signals[1:3] + _fallback_bullets("middle", keys))[:3]),
-        ("data_matrix", "Сценарии и итоговый выбор", _fallback_bullets("conclusion", keys)),
-    ]
-    specs = specs[:max(1, target_total)]
+    target_total = max(SLIDE_COUNT_MIN, min(SLIDE_COUNT_MAX, target_total or TARGET_SLIDE_COUNT))
+    layout_sequence = _default_layout_sequence(target_total)
+
+    titles_map = {
+        "cover": f"{topic}: аналитический обзор",
+        "agenda": "Повестка: что обсудим сегодня",
+        "context": "Контекст и рамка анализа",
+        "key_findings": "Ключевые находки",
+        "stat_highlight": "Цифра, определяющая историю",
+        "quote_highlight": "Голос источника",
+        "split_infographic": "Факторы и акценты",
+        "timeline": "Последовательность шагов",
+        "data_matrix": "Приоритеты: План vs Реальность",
+        "comparison": "Сравнение сценариев",
+        "takeaways": "Выводы и следующий шаг",
+        "hero_concept": "Концепт и позиционирование",
+    }
+
+    bullets_map = {
+        "cover": [
+            f"Тема: {topic}.",
+            "Формат: краткий аналитический разбор на уровне brief.",
+            "Аудитория: принимающие решения и команда эксперта.",
+        ],
+        "agenda": [
+            "Контекст и предпосылки обсуждения.",
+            "Ключевые находки и цифры.",
+            "Сравнения, сценарии и выводы.",
+            "Takeaways и следующие шаги.",
+        ],
+        "context": _fallback_bullets("intro", keys),
+        "key_findings": (signals[:3] + _fallback_bullets("middle", keys))[:4],
+        "stat_highlight": (signals[:2] + _fallback_bullets("middle", keys))[:3],
+        "quote_highlight": (signals[:1] + _fallback_bullets("middle", keys))[:2],
+        "split_infographic": (signals[1:4] + _fallback_bullets("middle", keys))[:4],
+        "timeline": (signals[:3] + _fallback_bullets("middle", keys))[:4],
+        "data_matrix": _fallback_bullets("conclusion", keys),
+        "comparison": (signals[:2] + _fallback_bullets("middle", keys))[:2],
+        "takeaways": _fallback_bullets("conclusion", keys),
+        "hero_concept": _fallback_bullets("intro", keys),
+    }
 
     slides: list[dict] = []
-    actual_total = len(specs)
-    for idx, (layout_type, title, bullets) in enumerate(specs, 1):
-        clean_bullets = _clean_units(bullets, min_len=14, max_items=3)
+    actual_total = len(layout_sequence)
+    for idx, layout_type in enumerate(layout_sequence, 1):
+        title = _smart_trim(titles_map.get(layout_type, f"Слайд {idx}"), 88)
+        raw_bullets = bullets_map.get(layout_type, _fallback_bullets("middle", keys))
+        clean_bullets = _clean_units(raw_bullets, min_len=14, max_items=4)
         if len(clean_bullets) < 3:
             section = "intro" if idx == 1 else "conclusion" if idx == actual_total else "middle"
             clean_bullets = (clean_bullets + _fallback_bullets(section, keys))[:3]
+
+        slide_stats: list[dict] = []
+        slide_quotes: list[dict] = []
+        if layout_type in ("key_findings", "stat_highlight", "data_matrix") and stats_pool:
+            slide_stats = stats_pool[:3]
+        if layout_type == "quote_highlight" and quotes_pool:
+            slide_quotes = quotes_pool[:1]
+
+        subtitle = ""
+        if layout_type == "cover":
+            subtitle = "Структурированный разбор материала: контекст, находки, выводы."
+        elif layout_type == "agenda":
+            subtitle = "Маршрут презентации и логика перехода от контекста к выводам."
+
+        speaker_notes = _fallback_speaker_notes(layout_type, title, clean_bullets)
+        source_hint = "На основе автоматически извлечённых тезисов исходного материала."
+
+        content_payload = {
+            "title": title,
+            "subtitle": subtitle,
+            "bullets": clean_bullets[:4],
+            "stats": slide_stats,
+            "quotes": slide_quotes,
+            "source_hint": source_hint,
+        }
+
         slides.append(
             {
                 "slide_number": idx,
-                "title": _smart_trim(title, 74),
-                "bullets": clean_bullets[:3],
+                "title": title,
+                "subtitle": subtitle,
+                "bullets": clean_bullets[:4],
+                "stats": slide_stats,
+                "quotes": slide_quotes,
+                "source_hint": source_hint,
+                "speaker_notes": speaker_notes,
                 "layout_type": layout_type,
                 "visual_meta_prompt": _build_image_prompt(
                     title,
@@ -318,10 +487,7 @@ def _fallback_slide_pack(text_content: str, style: str, target_total: int) -> li
                     idx == actual_total,
                     layout_type,
                 ),
-                "content": {
-                    "title": _smart_trim(title, 74),
-                    "bullets": clean_bullets[:3],
-                },
+                "content": content_payload,
             }
         )
     return slides
@@ -357,31 +523,65 @@ def _style_hint_for_prompt(style: str) -> str:
     return "premium corporate editorial palette, clean geometry, cinematic lighting"
 
 
+def _default_layout_sequence(total_slides: int) -> list[str]:
+    total = max(4, min(12, total_slides or TARGET_SLIDE_COUNT))
+    base = ["cover", "agenda", "context", "key_findings"]
+    middle_pool = [
+        "stat_highlight",
+        "split_infographic",
+        "timeline",
+        "data_matrix",
+        "quote_highlight",
+        "comparison",
+    ]
+    tail = ["takeaways"]
+    needed_middle = max(0, total - len(base) - len(tail))
+    middle: list[str] = []
+    for idx in range(needed_middle):
+        middle.append(middle_pool[idx % len(middle_pool)])
+    return (base + middle + tail)[:total]
+
+
 def _pick_layout_type(title: str, bullets: list[str], slide_index: int, total_slides: int) -> str:
     text = " ".join([title, *bullets]).lower()
-    sequence_map = {
-        3: ["hero_concept", "timeline", "data_matrix"],
-        4: ["hero_concept", "split_infographic", "timeline", "data_matrix"],
-        5: ["hero_concept", "split_infographic", "timeline", "data_matrix", "split_infographic"],
-    }
-    if total_slides in sequence_map and 1 <= slide_index <= len(sequence_map[total_slides]):
-        return sequence_map[total_slides][slide_index - 1]
+    sequence = _default_layout_sequence(total_slides)
+    if 1 <= slide_index <= len(sequence):
+        default_choice = sequence[slide_index - 1]
+    else:
+        default_choice = "split_infographic"
 
     if slide_index == 1:
-        return "hero_concept"
+        return "cover"
     if slide_index == total_slides:
-        return "data_matrix"
+        return "takeaways"
+    if slide_index == 2 and total_slides >= 4:
+        return "agenda"
+
+    if any(token in text for token in ("цитат", "quote", "по словам", "писал:", "отметил")):
+        return "quote_highlight"
+    if any(token in text for token in ("%", "млрд", "млн", "трлн", "рост", "прирост", "доля", "kpi", "метрик")):
+        return "stat_highlight"
     if any(token in text for token in ("план", "факт", "реальность", "сравн", "trade-off", "vs", "квадрант", "матриц")):
         return "data_matrix"
-    if any(token in text for token in ("этап", "процесс", "метод", "pipeline", "stack", "слой", "уров")):
+    if any(token in text for token in ("этап", "процесс", "метод", "pipeline", "stack", "слой", "уров", "roadmap", "последовательн")):
         return "timeline"
     if any(token in text for token in ("контекст", "рамка", "парадигма", "концепт", "манифест", "позиционирование")):
-        return "hero_concept"
-    return "split_infographic"
+        return "context"
+    if any(token in text for token in ("вывод", "итог", "takeaway", "следующ")):
+        return "takeaways"
+    return default_choice
 
 
 def _layout_hint(layout_type: str) -> str:
     hints = {
+        "cover": "monumental editorial title scene, cinematic depth, calm central focal area for a bold headline, premium publication cover feel",
+        "agenda": "subtle architectural grid evoking a table of contents, soft verticals, calm breathing space for a clean numbered list overlay",
+        "context": "atmospheric establishing shot that sets the thematic stage, wide horizon, soft lighting, space for a contextual narrative block",
+        "key_findings": "analytical editorial composition with clean zones for large numbers, side notes and annotation ribbons",
+        "stat_highlight": "bold hero composition built around a single commanding numeric focal point, spotlight lighting, minimal supporting texture",
+        "quote_highlight": "quiet editorial spread with a soft portrait-like ambiance and a generous quiet zone reserved for a pulled quote",
+        "comparison": "symmetric split composition with two balanced halves ready for side-by-side contrast blocks",
+        "takeaways": "closing editorial spread with a summary grid feel, warm finishing tones, clean list area on one side",
         "hero_concept": "strong editorial hero composition with abstract conceptual centerpiece on the right and calm left area",
         "split_infographic": "clean right-side infographic zones for cards and analytical callouts, balanced negative space",
         "timeline": "directional timeline rhythm with sequential anchors on right side, structured flow lines",
@@ -404,7 +604,7 @@ def _build_image_prompt(topic: str, style: str, slide_index: int, is_title: bool
     )
 
 
-def _normalize_model_bullets(raw_value) -> list[str]:
+def _normalize_model_bullets(raw_value, *, limit: int = 5) -> list[str]:
     if isinstance(raw_value, list):
         values = raw_value
     else:
@@ -414,7 +614,63 @@ def _normalize_model_bullets(raw_value) -> list[str]:
         cleaned = _clean_bullet(str(item or ""))
         if cleaned:
             bullets.append(cleaned)
-    return bullets[:4]
+    return bullets[:limit]
+
+
+def _clean_inline_text(value, limit: int) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip().strip("«»\"' ")
+    return text[:limit]
+
+
+def _normalize_stats(raw_value) -> list[dict]:
+    if not isinstance(raw_value, list):
+        return []
+    stats: list[dict] = []
+    for item in raw_value:
+        if isinstance(item, dict):
+            value = _clean_inline_text(item.get("value") or item.get("number") or item.get("metric"), 24)
+            label = _clean_inline_text(item.get("label") or item.get("caption") or item.get("description"), 90)
+        else:
+            text = _clean_inline_text(item, 110)
+            match = re.match(r"(\S+?)\s*[-—:]\s*(.+)", text)
+            if match:
+                value = _clean_inline_text(match.group(1), 24)
+                label = _clean_inline_text(match.group(2), 90)
+            else:
+                value = ""
+                label = text
+        if value or label:
+            stats.append({"value": value, "label": label})
+        if len(stats) >= 4:
+            break
+    return stats
+
+
+def _normalize_quotes(raw_value) -> list[dict]:
+    if not isinstance(raw_value, list):
+        return []
+    quotes: list[dict] = []
+    for item in raw_value:
+        if isinstance(item, dict):
+            text = _clean_inline_text(item.get("text") or item.get("quote") or item.get("body"), 220)
+            author = _clean_inline_text(item.get("author") or item.get("source") or item.get("by"), 90)
+        else:
+            text = _clean_inline_text(item, 220)
+            author = ""
+        if text:
+            quotes.append({"text": text, "author": author})
+        if len(quotes) >= 3:
+            break
+    return quotes
+
+
+def _normalize_speaker_notes(raw_value) -> str:
+    if isinstance(raw_value, list):
+        joined = " ".join(str(item or "").strip() for item in raw_value if str(item or "").strip())
+    else:
+        joined = str(raw_value or "").strip()
+    joined = re.sub(r"\s+", " ", joined).strip()
+    return joined[:1200]
 
 
 def _normalize_model_structure(result_text: str, style: str) -> str:
@@ -431,24 +687,29 @@ def _normalize_model_structure(result_text: str, style: str) -> str:
         return ""
 
     slides = [slide for slide in slides if isinstance(slide, dict)]
-    if len(slides) < TARGET_SLIDE_COUNT:
+    if len(slides) < SLIDE_COUNT_MIN:
         return ""
 
+    actual_total = max(SLIDE_COUNT_MIN, min(SLIDE_COUNT_MAX, len(slides)))
+    slides = slides[:actual_total]
+
     normalized: list[dict] = []
-    actual_total = min(TARGET_SLIDE_COUNT, len(slides))
-    for idx, slide in enumerate(slides[:actual_total], 1):
+    for idx, slide in enumerate(slides, 1):
         content = slide.get("content") if isinstance(slide.get("content"), dict) else {}
-        title = _clean_bullet(
-            str(
-                content.get("title")
-                or content.get("headline")
-                or content.get("heading")
-                or slide.get("title")
-                or slide.get("headline")
-                or slide.get("heading")
-                or f"Слайд {idx}"
-            )
-        )[:80]
+        raw_title = (
+            content.get("title")
+            or content.get("headline")
+            or content.get("heading")
+            or slide.get("title")
+            or slide.get("headline")
+            or slide.get("heading")
+            or f"Слайд {idx}"
+        )
+        title = _clean_bullet(str(raw_title))[:90]
+        subtitle = _clean_inline_text(
+            content.get("subtitle") or content.get("lead") or slide.get("subtitle") or slide.get("lead"),
+            180,
+        )
         bullets = _normalize_model_bullets(
             content.get("bullets")
             or content.get("theses")
@@ -456,24 +717,61 @@ def _normalize_model_structure(result_text: str, style: str) -> str:
             or slide.get("bullets")
             or slide.get("theses")
             or slide.get("points")
-            or slide.get("content")
+            or slide.get("content"),
+            limit=5,
         )
-        layout_type = _pick_layout_type(title, bullets, idx, actual_total)
-        visual_meta_prompt = str(slide.get("visual_meta_prompt") or slide.get("image_prompt") or "").strip() or _build_image_prompt(
+        stats = _normalize_stats(content.get("stats") or slide.get("stats") or content.get("numbers") or slide.get("numbers"))
+        quotes = _normalize_quotes(content.get("quotes") or slide.get("quotes") or content.get("citations") or slide.get("citations"))
+        source_hint = _clean_inline_text(
+            content.get("source_hint")
+            or content.get("source")
+            or slide.get("source_hint")
+            or slide.get("source"),
+            220,
+        )
+        speaker_notes = _normalize_speaker_notes(
+            slide.get("speaker_notes")
+            or slide.get("notes")
+            or content.get("speaker_notes")
+            or content.get("notes")
+        )
+
+        layout_raw = str(slide.get("layout_type") or content.get("layout_type") or "").strip().lower()
+        layout_type = layout_raw if layout_raw in ALLOWED_LAYOUTS else _pick_layout_type(title, bullets, idx, actual_total)
+        if idx == 1 and layout_type not in ("cover", "hero_concept"):
+            layout_type = "cover"
+        if idx == actual_total and layout_type not in ("takeaways", "data_matrix"):
+            layout_type = "takeaways"
+
+        visual_meta_prompt = str(
+            slide.get("visual_meta_prompt") or slide.get("image_prompt") or ""
+        ).strip() or _build_image_prompt(
             title, style, idx, idx == 1, idx == actual_total, layout_type
         )
+
+        content_payload = {
+            "title": title or f"Слайд {idx}",
+            "subtitle": subtitle,
+            "bullets": bullets[:5],
+            "stats": stats,
+            "quotes": quotes,
+            "source_hint": source_hint,
+        }
+
         normalized.append(
             {
                 "slide_number": idx,
                 "title": title or f"Слайд {idx}",
-                "bullets": bullets[:4],
+                "subtitle": subtitle,
+                "bullets": bullets[:5],
+                "stats": stats,
+                "quotes": quotes,
+                "source_hint": source_hint,
+                "speaker_notes": speaker_notes,
                 "layout_type": layout_type,
                 "visual_meta_prompt": visual_meta_prompt,
                 "image_prompt": visual_meta_prompt,
-                "content": {
-                    "title": title or f"Слайд {idx}",
-                    "bullets": bullets[:4],
-                },
+                "content": content_payload,
             }
         )
 
@@ -481,7 +779,13 @@ def _normalize_model_structure(result_text: str, style: str) -> str:
 
 
 def _fallback_structure(text_content: str, style: str = "auto") -> str:
-    target_total = TARGET_SLIDE_COUNT
+    text_len = len((text_content or "").strip())
+    if text_len < 1200:
+        target_total = SLIDE_COUNT_MIN
+    elif text_len > 8000:
+        target_total = SLIDE_COUNT_MAX
+    else:
+        target_total = TARGET_SLIDE_COUNT
     slides = _fallback_slide_pack(text_content, style, target_total)
     return json.dumps(slides, ensure_ascii=False)
 
