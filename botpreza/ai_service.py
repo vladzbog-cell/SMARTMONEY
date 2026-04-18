@@ -11,9 +11,9 @@ from artemox_client import (
 )
 from reference_style_service import get_reference_style_brief
 
-MAX_INPUT_CHARS = 60000
-RETRY_INPUT_CHARS = 18000
-MODEL_TIMEOUT_SEC = 60
+MAX_INPUT_CHARS = 180000
+RETRY_INPUT_CHARS = 45000
+MODEL_TIMEOUT_SEC = 90
 
 def _env_int(name: str, default: int) -> int:
     raw = (os.getenv(name) or "").strip()
@@ -27,14 +27,20 @@ SLIDE_COUNT_MAX = max(SLIDE_COUNT_MIN, _env_int("PRESENTATION_MAX_SLIDES", 10))
 TARGET_SLIDE_COUNT = max(SLIDE_COUNT_MIN, min(SLIDE_COUNT_MAX, _env_int("PRESENTATION_TARGET_SLIDES", 8)))
 ULTRA_CHEAP_MODE = os.getenv("ULTRA_CHEAP_MODE", "0").strip().lower() in {"1", "true", "yes", "on"}
 DISABLE_TEXT_RETRY = os.getenv("DISABLE_TEXT_RETRY", "0").strip().lower() in {"1", "true", "yes", "on"}
-BRAIN_MODEL = os.getenv("ARTEMOX_BRAIN_MODEL", "gemini-1.5-pro").strip() or ARTEMOX_MODEL
+BRAIN_MODEL = os.getenv("ARTEMOX_BRAIN_MODEL", "").strip() or (ARTEMOX_MODEL or "gemini-2.5-pro")
+EXTRACTION_MODEL = os.getenv("ARTEMOX_EXTRACTION_MODEL", "").strip() or BRAIN_MODEL
+GROUNDING_MODEL = os.getenv("ARTEMOX_GROUNDING_MODEL", "").strip() or EXTRACTION_MODEL
+TWO_STAGE_PIPELINE = os.getenv("TWO_STAGE_PIPELINE", "1").strip().lower() in {"1", "true", "yes", "on"}
+ENABLE_GROUNDING_CHECK = os.getenv("ENABLE_GROUNDING_CHECK", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 if ULTRA_CHEAP_MODE:
-    MAX_INPUT_CHARS = min(MAX_INPUT_CHARS, 16000)
-    RETRY_INPUT_CHARS = min(RETRY_INPUT_CHARS, 9000)
-    MODEL_TIMEOUT_SEC = min(MODEL_TIMEOUT_SEC, 40)
+    MAX_INPUT_CHARS = min(MAX_INPUT_CHARS, 24000)
+    RETRY_INPUT_CHARS = min(RETRY_INPUT_CHARS, 12000)
+    MODEL_TIMEOUT_SEC = min(MODEL_TIMEOUT_SEC, 45)
     SLIDE_COUNT_MAX = min(SLIDE_COUNT_MAX, 8)
     TARGET_SLIDE_COUNT = min(TARGET_SLIDE_COUNT, SLIDE_COUNT_MAX)
+    TWO_STAGE_PIPELINE = False
+    ENABLE_GROUNDING_CHECK = False
 
 ALLOWED_LAYOUTS = (
     "cover",
@@ -144,6 +150,82 @@ SYSTEM_PROMPT = (
     "техно-диаграммы, график+вывод, архитектурные композиции.\n"
     "8. Между слайдами должно быть явное повествовательное развитие: контекст → находки → сравнения → выводы. "
     "Не допускай дубликатов и пустых слайдов.\n"
+)
+
+
+EXTRACTION_PROMPT = (
+    "Ты — аналитик-редактор уровня NotebookLM. Твоя задача — внимательно прочитать исходный материал "
+    "и вернуть структурированный 'evidence brief' для последующей сборки презентации.\n\n"
+    "Формат — строго валидный JSON без markdown, без пояснений. Схема:\n"
+    "{\n"
+    '  "topic": "о чём материал в одной фразе",\n'
+    '  "audience_guess": "для кого этот материал (1 фраза)",\n'
+    '  "thesis": "главный тезис или вывод материала (1-2 предложения)",\n'
+    '  "key_facts": ["6-12 ключевых фактов/тезисов, каждый как законченная мысль"],\n'
+    '  "numbers": [ {"value": "42%", "label": "что значит", "source_span": "короткая цитата из исходника (до 180 симв.)"} ],\n'
+    '  "quotes": [ {"text": "цитата дословно или близко", "author": "кто/источник", "source_span": "контекст (до 180 симв.)"} ],\n'
+    '  "entities": ["ключевые имена/бренды/термины"],\n'
+    '  "tensions": ["1-4 противоречия или компромисса, если есть"],\n'
+    '  "timeline": [ {"when": "2024", "what": "что произошло"} ],\n'
+    '  "comparisons": [ {"a": "сторона A", "b": "сторона B", "takeaway": "что важно"} ],\n'
+    '  "takeaways": ["3-6 практических выводов/действий"],\n'
+    '  "outline": ["линейный порядок тем для презентации (6-10 пунктов)"]\n'
+    "}\n\n"
+    "Правила:\n"
+    "1. Все числа и цитаты должны быть реально извлечены из исходника. source_span — фрагмент текста оригинала, "
+    "откуда ты взял факт (1-2 короткие фразы). Если нет — не выдумывай, оставь пустым массивом.\n"
+    "2. key_facts формулируй ёмко (до 160 символов), без воды. Это будут якоря для буллетов.\n"
+    "3. Не сокращай язык исходника: пиши на том же языке, что и материал (обычно русский).\n"
+    "4. Если материал очень короткий или бессодержательный — всё равно верни JSON с пустыми массивами, "
+    "но заполненными topic/thesis своими словами.\n"
+)
+
+
+COMPOSITION_PROMPT = (
+    "Ты — Арт-директор и редактор-аналитик уровня NotebookLM. У тебя уже есть evidence brief по материалу "
+    "(ключевые факты, цифры, цитаты, таймлайн, выводы). Твоя задача — превратить evidence в связную презентацию.\n\n"
+    f"{NOTEBOOKLM_PRODUCT_BRIEF}\n\n"
+    "ПРАВИЛО ОСНОВАНИЯ: КАЖДАЯ цифра и цитата в слайдах ДОЛЖНА ссылаться на evidence.numbers[] / evidence.quotes[]. "
+    "Ничего нельзя выдумывать. Если в evidence нет числа — на слайде числа тоже нет.\n\n"
+    f"Собери презентацию из {SLIDE_COUNT_MIN}–{SLIDE_COUNT_MAX} слайдов (ориентир {TARGET_SLIDE_COUNT}). "
+    "Количество слайдов подбирай под объём и плотность evidence.\n\n"
+    "Повествование как в NotebookLM Audio Overview: cover → agenda → context → ключевые находки с цифрами/цитатами → "
+    "сравнения/таймлайн/сценарии → takeaways.\n\n"
+    "Верни строго валидный JSON-массив слайдов без markdown, по схеме:\n"
+    '[ {\n'
+    '  "slide_number": 1,\n'
+    '  "layout_type": "cover|agenda|context|key_findings|split_infographic|timeline|data_matrix|quote_highlight|stat_highlight|comparison|takeaways|hero_concept",\n'
+    '  "visual_meta_prompt": "подробный промпт фона без текста в изображении",\n'
+    '  "content": {\n'
+    '    "title": "краткий заголовок",\n'
+    '    "subtitle": "опциональный лид",\n'
+    '    "bullets": ["2-5 содержательных буллетов"],\n'
+    '    "stats": [ {"value": "42%", "label": "…", "source_span": "…"} ],\n'
+    '    "quotes": [ {"text": "…", "author": "…", "source_span": "…"} ],\n'
+    '    "source_hint": "на каком фрагменте evidence основан слайд (1 предложение)"\n'
+    '  },\n'
+    '  "speaker_notes": "3-5 предложений разговорных заметок докладчика"\n'
+    '} ]\n\n'
+    "Правила:\n"
+    "1. Первый слайд — cover, второй — agenda (3-6 пунктов из evidence.outline), последний — takeaways.\n"
+    "2. Layout подбирай по смыслу слайда: stat_highlight — один акцент-цифра; quote_highlight — пулл-цитата; "
+    "comparison — два сценария; timeline — этапы; data_matrix — план/факт; key_findings — 3-4 находки с цифрами.\n"
+    "3. Каждое число/цитата содержит source_span из evidence. Если source_span недоступен — не вставляй число/цитату.\n"
+    "4. speaker_notes — как докладчик объяснит слайд вслух, без дублирования буллетов дословно.\n"
+    "5. visual_meta_prompt — только визуал фона, без текста в изображении. Фон держит чистые зоны под оверлей.\n"
+    "6. Язык — как в evidence (обычно русский).\n"
+)
+
+
+GROUNDING_PROMPT = (
+    "Проверь презентацию на основание (grounding). Тебе даны evidence brief и draft слайдов. "
+    "Верни чистый JSON-массив слайдов в том же формате, но: \n"
+    "- удали stats, для которых нет совпадения по value/label в evidence.numbers;\n"
+    "- удали quotes, для которых нет совпадения в evidence.quotes;\n"
+    "- не меняй структуру, заголовки, bullets и speaker_notes, если они логически опираются на evidence.key_facts;\n"
+    "- если после чистки слайд stat_highlight остался без цифры — поменяй layout на split_infographic и оставь bullets;\n"
+    "- если quote_highlight остался без цитаты — поменяй layout на context.\n"
+    "Ничего не добавляй. Верни только валидный JSON-массив слайдов.\n"
 )
 
 
